@@ -146,10 +146,41 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
     expect(postCount(fake)).toBe(0);
   });
 
+  it("для Товары+Услуги требует явный operationKind и проверяет совместимость", async () => {
+    const { client, fake } = await setup();
+    const mixedBase = {
+      ...args,
+      sumIncludesVat: true,
+      documentTotal: 300,
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          quantity: 1,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+        },
+      ],
+    };
+    const missing = await call(client, { ...mixedBase, confirm: false });
+    expect(missing.isError).toBe(true);
+    expect(JSON.stringify(missing)).toContain("operationKind");
+    expect(postCount(fake)).toBe(0);
+
+    const wrong = await call(client, { ...mixedBase, operationKind: "Товары", confirm: false });
+    expect(wrong.isError).toBe(true);
+    expect(JSON.stringify(wrong)).toContain("ПокупкаКомиссия");
+  });
+
   it("смешанный документ: товарная и сервисная строки в отдельных таблицах", async () => {
     const { client } = await setup();
     const mixed = {
       ...args,
+      operationKind: "ПокупкаКомиссия",
       sumIncludesVat: true,
       documentTotal: 300,
       lines: [
@@ -182,7 +213,7 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
     expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
     const payload = preview.structuredContent?.payload as Record<string, unknown>;
     expect(payload).toMatchObject({
-      ВидОперации: "Товары",
+      ВидОперации: "ПокупкаКомиссия",
       СуммаВключаетНДС: true,
       СуммаДокумента: 300,
     });

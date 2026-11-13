@@ -3142,6 +3142,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         settlementAccountRef: z.string().uuid().optional().describe("Ref_Key счёта расчётов (60.01)"),
         advanceAccountRef: z.string().uuid().optional().describe("Ref_Key счёта авансов (60.02)"),
         universalDocument: z.boolean().optional().describe("ЭтоУниверсальныйДокумент"),
+        operationKind: z
+          .enum(["Товары", "Услуги", "ПокупкаКомиссия"])
+          .optional()
+          .describe("Исторический ВидОперации; для Товары+Услуги обязателен явный выбор"),
         allowGenericContractKind: z
           .boolean()
           .optional()
@@ -3173,6 +3177,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       settlementAccountRef,
       advanceAccountRef,
       universalDocument,
+      operationKind,
       allowGenericContractKind,
       sumIncludesVat,
       lines,
@@ -3199,6 +3204,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           settlementAccountRef !== undefined ||
           advanceAccountRef !== undefined ||
           universalDocument !== undefined ||
+          operationKind !== undefined ||
           allowGenericContractKind !== undefined ||
           serviceLines !== undefined ||
           goodsLines.some(
@@ -3241,7 +3247,27 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         if (!goodsLines.length && !serviceLines?.length)
           throw new InputError("Историческое поступление требует товарные или сервисные строки.");
         if (!contractRef) throw new InputError("Историческое поступление требует явный contractRef.");
-        const serviceOnly = goodsLines.length === 0 && (serviceLines?.length ?? 0) > 0;
+        const hasGoods = goodsLines.length > 0;
+        const hasServices = (serviceLines?.length ?? 0) > 0;
+        const serviceOnly = !hasGoods && hasServices;
+        if (hasGoods && hasServices && operationKind === undefined)
+          throw new InputError(
+            "Для исторической комбинации Товары+Услуги укажите operationKind явно: «ПокупкаКомиссия».",
+          );
+        const resolvedOperationKind = operationKind ?? (hasGoods ? "Товары" : "Услуги");
+        if (hasGoods && hasServices && resolvedOperationKind !== "ПокупкаКомиссия")
+          throw new InputError(
+            "Комбинация Товары+Услуги совместима только с operationKind=«ПокупкаКомиссия».",
+          );
+        if (
+          hasGoods &&
+          !hasServices &&
+          resolvedOperationKind !== "Товары" &&
+          resolvedOperationKind !== "ПокупкаКомиссия"
+        )
+          throw new InputError("Товарная таблица совместима с operationKind «Товары»/«ПокупкаКомиссия».");
+        if (!hasGoods && hasServices && resolvedOperationKind === "Товары")
+          throw new InputError("Для таблицы «Услуги» operationKind «Товары» несовместим.");
         if (!serviceOnly && !warehouse)
           throw new InputError("Историческое поступление требует явный warehouse (Ref_Key).");
         const contract = await resolveCustomerContract(conn, {
@@ -3510,11 +3536,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               `Номер «${number}» уже занят документом ${String(conflict["Ref_Key"] ?? "")} за ${year} год.`,
             );
         }
-        const operationKind = serviceOnly ? "Услуги" : "Товары";
         const payload = clean({
           Date: odataDate(documentDate),
           Number: number.trim(),
-          ВидОперации: operationKind,
+          ВидОперации: resolvedOperationKind,
           Posted: false,
           Организация_Key: org.key,
           Склад_Key: warehouseKey,
@@ -3563,7 +3588,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const expectedHeader: Record<string, unknown> = {
           Date: effectivePayload["Date"],
           Number: effectivePayload["Number"],
-          ВидОперации: operationKind,
+          ВидОперации: resolvedOperationKind,
           Posted: false,
           DeletionMark: false,
           Организация_Key: org.key,

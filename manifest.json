@@ -7521,6 +7521,15 @@
             "description": "ЭтоУниверсальныйДокумент",
             "type": "boolean"
           },
+          "operationKind": {
+            "description": "Исторический ВидОперации; для Товары+Услуги обязателен явный выбор",
+            "type": "string",
+            "enum": [
+              "Товары",
+              "Услуги",
+              "ПокупкаКомиссия"
+            ]
+          },
           "allowGenericContractKind": {
             "description": "Явное бизнес-основание принять договор вида «Прочее»",
             "type": "boolean"
