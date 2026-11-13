@@ -11112,7 +11112,7 @@
     {
       "name": "write.purchase.create_received_invoice",
       "title": "Создать счёт-фактуру полученный",
-      "description": "Создаёт «Счёт-фактура полученный» НА ОСНОВАНИИ поступления товаров и услуг. Реквизиты наследуются от основания; дату входящего счёта-фактуры продавца указывают вручную (в поступлении её нет). НЕПРОВЕДЁННЫЙ; провести — post_document. dry-run/confirm.",
+      "description": "Создаёт «Счёт-фактура полученный» НА ОСНОВАНИИ поступления товаров и услуг. Реквизиты наследуются от основания; дату входящего счёта-фактуры продавца указывают вручную (в поступлении её нет). НЕПРОВЕДЁННЫЙ; провести — post_document. Исторический opt-in: отдельные Number/Date с секундами, входящий номер/дата/время, код получения, представление номера, код вида операции и флаг вычета; gross/VAT и организация/договор — из точного основания; дубль по номеру/году/организации и по основанию, полный readback. dry-run/confirm.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -11128,17 +11128,55 @@
             "description": "Имя набора документа-основания, если это не «Поступление…»",
             "type": "string"
           },
-          "incomingDate": {
-            "description": "Дата входящего счёта-фактуры продавца YYYY-MM-DD",
+          "number": {
+            "description": "Номер документа БП",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "date": {
+            "description": "Дата регистрации YYYY-MM-DD (по умолчанию сегодня)",
             "type": "string"
+          },
+          "time": {
+            "description": "Точное время документа HH:MM:SS",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "incomingNumber": {
+            "description": "Номер входящего счёта-фактуры",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "incomingDate": {
+            "description": "Дата входящего счёта-фактуры YYYY-MM-DD",
+            "type": "string"
+          },
+          "incomingTime": {
+            "description": "Время входящего счёта-фактуры HH:MM:SS",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "receiptCode": {
+            "description": "КодСпособаПолучения",
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "numberRepresentation": {
+            "description": "ПредставлениеНомера",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
           },
           "operationCode": {
             "description": "Код вида операции (по умолчанию 01)",
             "type": "string"
           },
-          "date": {
-            "description": "Дата регистрации YYYY-MM-DD (по умолчанию сегодня)",
-            "type": "string"
+          "vatDeductible": {
+            "description": "НДСПредъявленКВычету",
+            "type": "boolean"
           },
           "confirm": {
             "default": false,

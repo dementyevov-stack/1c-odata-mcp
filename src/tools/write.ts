@@ -5594,7 +5594,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       description:
         "Создаёт «Счёт-фактура полученный» НА ОСНОВАНИИ поступления товаров и услуг. " +
         "Реквизиты наследуются от основания; дату входящего счёта-фактуры продавца указывают вручную " +
-        "(в поступлении её нет). НЕПРОВЕДЁННЫЙ; провести — post_document. dry-run/confirm.",
+        "(в поступлении её нет). НЕПРОВЕДЁННЫЙ; провести — post_document. " +
+        "Исторический opt-in: отдельные Number/Date с секундами, входящий номер/дата/время, код получения, " +
+        "представление номера, код вида операции и флаг вычета; gross/VAT и организация/договор — из точного " +
+        "основания; дубль по номеру/году/организации и по основанию, полный readback. dry-run/confirm.",
       inputSchema: z.object({
         database: databaseField,
         baseDocumentRef: z.string().describe("Ref_Key документа-основания (поступление товаров и услуг)"),
@@ -5602,14 +5605,50 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .string()
           .optional()
           .describe("Имя набора документа-основания, если это не «Поступление…»"),
-        incomingDate: z.string().optional().describe("Дата входящего счёта-фактуры продавца YYYY-MM-DD"),
-        operationCode: z.string().optional().describe("Код вида операции (по умолчанию 01)"),
+        number: z.string().trim().min(1).max(100).optional().describe("Номер документа БП"),
         date: z.string().optional().describe("Дата регистрации YYYY-MM-DD (по умолчанию сегодня)"),
+        time: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Точное время документа HH:MM:SS"),
+        incomingNumber: z
+          .string()
+          .trim()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Номер входящего счёта-фактуры"),
+        incomingDate: z.string().optional().describe("Дата входящего счёта-фактуры YYYY-MM-DD"),
+        incomingTime: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Время входящего счёта-фактуры HH:MM:SS"),
+        receiptCode: z.number().int().optional().describe("КодСпособаПолучения"),
+        numberRepresentation: z.string().trim().min(1).max(200).optional().describe("ПредставлениеНомера"),
+        operationCode: z.string().optional().describe("Код вида операции (по умолчанию 01)"),
+        vatDeductible: z.boolean().optional().describe("НДСПредъявленКВычету"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
     },
-    ({ database, baseDocumentRef, baseDocumentEntity, incomingDate, operationCode, date, confirm }) =>
+    ({
+      database,
+      baseDocumentRef,
+      baseDocumentEntity,
+      number,
+      date,
+      time,
+      incomingNumber,
+      incomingDate,
+      incomingTime,
+      receiptCode,
+      numberRepresentation,
+      operationCode,
+      vatDeductible,
+      confirm,
+    }) =>
       guard("write.purchase.create_received_invoice", async () => {
         const conn = ctx.db(database);
         const set = await requireEntity(
@@ -5626,28 +5665,185 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ));
         const b = await invoiceBasis(conn, baseSet, baseDocumentRef);
         const baseGuid = baseDocumentRef.replace(/[{}']/g, "");
+        const historical =
+          number !== undefined ||
+          time !== undefined ||
+          incomingNumber !== undefined ||
+          incomingTime !== undefined ||
+          receiptCode !== undefined ||
+          numberRepresentation !== undefined ||
+          vatDeductible !== undefined;
+        if (historical) {
+          if (!number) throw new InputError("Исторический счёт-фактура требует number.");
+          if (!date) throw new InputError("Исторический счёт-фактура требует date.");
+          const props = new Map(
+            (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          const need = (field: string, type: string): void => {
+            if (props.get(field) !== type)
+              throw new InputError(`Схема счёта-фактуры не публикует ${field} с типом ${type}.`);
+          };
+          for (const [field, type] of [
+            ["Number", "Edm.String"],
+            ["Date", "Edm.DateTime"],
+            ["НомерВходящегоДокумента", "Edm.String"],
+            ["ДатаВходящегоДокумента", "Edm.DateTime"],
+            ["ПредставлениеНомера", "Edm.String"],
+            ["КодСпособаПолучения", "Edm.Int16"],
+            ["КодВидаОперации", "Edm.String"],
+            ["НДСПредъявленКВычету", "Edm.Boolean"],
+            ["СуммаДокумента", "Edm.Double"],
+            ["СуммаНДСДокумента", "Edm.Double"],
+            ["ДокументОснование", "Edm.String"],
+            ["ДокументОснование_Type", "Edm.String"],
+            ["Posted", "Edm.Boolean"],
+            ["DeletionMark", "Edm.Boolean"],
+          ] as const)
+            need(field, type);
+          // Дубль по номеру/году/организации и по основанию.
+          const select = ["Ref_Key", "Number", "Date", "Организация_Key", "ДокументОснование"];
+          let found: ODataEntity[];
+          try {
+            found = (await fetchAll<ODataEntity>(conn.client, set, { select }, conn.behavior.pageSize, 5_000))
+              .rows;
+          } catch (error) {
+            if (!(error instanceof ODataError && error.status === 500)) throw error;
+            found = (await fetchAll<ODataEntity>(conn.client, set, { select }, conn.behavior.pageSize, 5_000))
+              .rows;
+          }
+          const year = String(
+            odataDate(time ? new Date(`${date}T${time}`) : new Date(`${date}T00:00:00`)),
+          ).slice(0, 4);
+          const duplicate = found.find((r) => {
+            const sameBasis =
+              String(r["ДокументОснование"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() === baseGuid.toLowerCase();
+            const sameNumber =
+              String(r["Number"] ?? "").trim() === number.trim() &&
+              String(r["Организация_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() === b.org.toLowerCase() &&
+              String(r["Date"] ?? "").slice(0, 4) === year;
+            return sameBasis || sameNumber;
+          });
+          if (duplicate)
+            throw new InputError(
+              `Счёт-фактура по этому основанию или с номером «${number}» за ${year} год уже существует: ` +
+                `${String(duplicate["Ref_Key"] ?? "")}.`,
+            );
+        }
         const baseRow = clean({
           LineNumber: 1,
           ДокументОснование: baseGuid,
           ДокументОснование_Type: `StandardODATA.${baseSet}`,
         });
+        const docDate = time ? new Date(`${date}T${time}`) : date ? new Date(`${date}T00:00:00`) : new Date();
+        const incoming = incomingDate
+          ? odataDate(new Date(`${incomingDate}T${incomingTime ?? "00:00:00"}`))
+          : undefined;
         const payload = clean({
-          Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
+          Date: odataDate(docDate),
+          ...(number ? { Number: number.trim() } : {}),
           Posted: false,
           ВидСчетаФактуры: "НаПоступление",
           Организация_Key: b.org,
           Контрагент_Key: b.counterparty,
           ДоговорКонтрагента_Key: b.contract,
-          ДатаВходящегоДокумента: incomingDate ? odataDate(new Date(`${incomingDate}T00:00:00`)) : undefined,
+          ...(incomingNumber ? { НомерВходящегоДокумента: incomingNumber } : {}),
+          ...(incoming ? { ДатаВходящегоДокумента: incoming } : {}),
+          ...(numberRepresentation ? { ПредставлениеНомера: numberRepresentation } : {}),
+          ...(receiptCode !== undefined ? { КодСпособаПолучения: receiptCode } : {}),
           ДокументОснование: baseGuid,
           ДокументОснование_Type: `StandardODATA.${baseSet}`,
-          НДСПредъявленКВычету: true,
+          НДСПредъявленКВычету: vatDeductible ?? true,
           КодВидаОперации: operationCode ?? "01",
           СуммаДокумента: b.total,
           СуммаНДСДокумента: b.vat,
           ДокументыОснования: [baseRow],
         });
-        return createOrPreview(conn, set, payload, confirm);
+        let effectivePayload = payload;
+        const created = await createOrPreview(conn, set, payload, confirm, undefined, {
+          prepared: (prepared) => {
+            effectivePayload = prepared;
+          },
+        });
+        if (!historical || !confirm || created.isError) return created;
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+        if (!ref) return created;
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch {
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              {
+                type: "text",
+                text: "Счёт-фактура создана, но контрольное чтение не удалось; повтор запрещён.",
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed" },
+          };
+        }
+        const expectedHeader: Record<string, unknown> = {
+          Number: effectivePayload["Number"],
+          Date: effectivePayload["Date"],
+          Posted: false,
+          DeletionMark: false,
+          ВидСчетаФактуры: "НаПоступление",
+          Организация_Key: b.org,
+          Контрагент_Key: b.counterparty,
+          ДоговорКонтрагента_Key: b.contract,
+          ...(incomingNumber ? { НомерВходящегоДокумента: incomingNumber } : {}),
+          ...(incoming ? { ДатаВходящегоДокумента: incoming } : {}),
+          ...(numberRepresentation ? { ПредставлениеНомера: numberRepresentation } : {}),
+          ...(receiptCode !== undefined ? { КодСпособаПолучения: receiptCode } : {}),
+          ДокументОснование: baseGuid,
+          ДокументОснование_Type: `StandardODATA.${baseSet}`,
+          НДСПредъявленКВычету: vatDeductible ?? true,
+          КодВидаОперации: operationCode ?? "01",
+          СуммаДокумента: b.total,
+          СуммаНДСДокумента: b.vat,
+        };
+        const mismatch: string[] = [];
+        const types = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        for (const [field, value] of Object.entries(expectedHeader))
+          if (!sameStoredValue(value, actual[field], types.get(field) ?? "Edm.String")) mismatch.push(field);
+        const actualBasis = actual["ДокументыОснования"];
+        if (!Array.isArray(actualBasis) || actualBasis.length !== 1) mismatch.push("ДокументыОснования");
+        else {
+          const row = actualBasis[0] as Record<string, unknown>;
+          if (
+            String(row["ДокументОснование"] ?? "")
+              .replace(/[{}]/g, "")
+              .toLowerCase() !== baseGuid.toLowerCase() ||
+            String(row["ДокументОснование_Type"] ?? "") !== `StandardODATA.${baseSet}`
+          )
+            mismatch.push("ДокументыОснования[1]");
+        }
+        if (mismatch.length)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text: `Счёт-фактура создана (Ref_Key ${ref}), но контрольное чтение не подтвердило: ${mismatch.join(", ")}. Повтор запрещён.`,
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed", mismatches: mismatch },
+          };
+        return withStructured(created, {
+          verification: "ok",
+          verifiedFields: [...Object.keys(expectedHeader), "ДокументыОснования[1]"],
+        });
       }),
   );
 
