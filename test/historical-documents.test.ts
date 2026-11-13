@@ -45,11 +45,21 @@ async function setup(options: Options = {}) {
   const fake = fake1C({ READ_ONLY: "false", ODATA_WRITABLE: "true" }, { data });
   const available = await fake.conn.available();
   vi.spyOn(fake.conn, "available").mockResolvedValue(
-    new Set([...available, "Catalog_ВидыНоменклатуры", "Catalog_ЕдиницыИзмерения"]),
+    new Set([
+      ...available,
+      "Catalog_ВидыНоменклатуры",
+      "Catalog_КлассификаторЕдиницИзмерения",
+      "Catalog_ЕдиницыИзмерения",
+    ]),
   );
+  const unitLookups: string[] = [];
   const originalGetEntity = fake.conn.client.getEntity.bind(fake.conn.client);
   vi.spyOn(fake.conn.client, "getEntity").mockImplementation(async (path: string) => {
-    if (options.missingUnit && path.startsWith("Catalog_ЕдиницыИзмерения("))
+    if (
+      options.missingUnit &&
+      (path.startsWith("Catalog_ЕдиницыИзмерения(") ||
+        path.startsWith("Catalog_КлассификаторЕдиницИзмерения("))
+    )
       throw new ODataError({ kind: "not_found", message: "нет единицы" });
     if (
       options.badVatReadback &&
@@ -60,8 +70,20 @@ async function setup(options: Options = {}) {
       const rows = actual["Товары"] as Array<Record<string, unknown>>;
       return { ...actual, Товары: [{ ...rows[0], СуммаНДС: 0 }] };
     }
-    const known = /^Catalog_(ВидыНоменклатуры|ЕдиницыИзмерения)\(guid'([^']+)'\)/.exec(path);
-    if (known) return { Ref_Key: known[2]!, DeletionMark: false };
+    if (path.startsWith("Catalog_ДоговорыКонтрагентов("))
+      return {
+        Ref_Key: CTR,
+        Owner_Key: CP,
+        Организация_Key: ORG,
+        ВидДоговора: "СПокупателем",
+        DeletionMark: false,
+      };
+    const known =
+      /^Catalog_(ВидыНоменклатуры|ЕдиницыИзмерения|КлассификаторЕдиницИзмерения)\(guid'([^']+)'\)/.exec(path);
+    if (known) {
+      unitLookups.push(path);
+      return { Ref_Key: known[2]!, DeletionMark: false };
+    }
     return originalGetEntity(path);
   });
   const server = createServer(fake.ctx);
@@ -74,7 +96,7 @@ async function setup(options: Options = {}) {
     await server.close().catch(() => undefined);
     await rm(dir, { recursive: true, force: true });
   });
-  return { fake, client };
+  return { fake, client, unitLookups };
 }
 
 const postCount = (fake: ReturnType<typeof fake1C>): number =>
@@ -215,7 +237,7 @@ describe("write.catalog.create_nomenclature: исторические opt-in п�
   };
 
   it("переносит Code/вид/единицу/группу/ВидСтавкиНДС и проверяет readback", async () => {
-    const { client, fake } = await setup();
+    const { client, fake, unitLookups } = await setup();
     const preview = await call(client, "write.catalog.create_nomenclature", {
       ...nomArgs,
       confirm: false,
@@ -232,6 +254,10 @@ describe("write.catalog.create_nomenclature: исторические opt-in п�
     const created = await confirmAfterPreview(client, "write.catalog.create_nomenclature", nomArgs);
     expect(created.isError, JSON.stringify(created)).toBeFalsy();
     expect(created.structuredContent).toMatchObject({ created: true, verification: "ok" });
+    expect(
+      unitLookups.some((p) => p.startsWith("Catalog_КлассификаторЕдиницИзмерения(")),
+      "единица должна проверяться в актуальном каталоге BP",
+    ).toBe(true);
     expect(postCount(fake)).toBe(1);
   });
 

@@ -2262,7 +2262,18 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           if (groupRef) await existingTarget(CATALOGS.nomenclatureGroups, groupRef, "Номенклатурная группа");
           if (serviceKindRef)
             await existingTarget(["Catalog_ВидыНоменклатуры"], serviceKindRef, "Вид номенклатуры");
-          if (unitRef) await existingTarget(["Catalog_ЕдиницыИзмерения"], unitRef, "Единица измерения");
+          if (unitRef) {
+            const meta = await conn.getMetadata();
+            const navigation = meta.entities
+              .get("Catalog_Номенклатура")
+              ?.navigations.find((n) => n.name === "ЕдиницаИзмерения");
+            const unitCandidates = [
+              navigation?.toType,
+              "Catalog_КлассификаторЕдиницИзмерения",
+              "Catalog_ЕдиницыИзмерения",
+            ].filter((name): name is string => Boolean(name));
+            await existingTarget(unitCandidates, unitRef, "Единица измерения");
+          }
           if (code !== undefined) {
             const select = ["Ref_Key", "Code", "Description"];
             let rows: ODataEntity[];
@@ -2539,6 +2550,24 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             throw new InputError("Исторический счёт требует явный contractRef; договор не подставляется.");
           if (!orgBankAccount || !GUID_RE.test(orgBankAccount))
             throw new InputError("Исторический счёт требует явный Ref_Key банковского счёта организации.");
+          await resolveCustomerContract(conn, { orgKey: org.key, counterpartyRef, contractRef });
+          const bankSet = resolveEntity(CATALOGS.bankAccounts, await conn.available());
+          if (!bankSet) throw new InputError("Справочник «Банковские счета» не опубликован.");
+          try {
+            const bankDoc = await conn.client.getEntity(
+              `${bankSet}(${odataGuid(orgBankAccount)})?$format=json&$select=Ref_Key,Owner`,
+            );
+            if (
+              String(bankDoc["Owner"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== org.key.toLowerCase()
+            )
+              throw new InputError("Исторический счёт: банковский счёт принадлежит не этой организации.");
+          } catch (error) {
+            if (error instanceof ODataError && error.kind === "not_found")
+              throw new InputError(`Банковский счёт ${orgBankAccount} не найден.`);
+            throw error;
+          }
         }
         const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const rows = buildInvoiceRows(lines);
