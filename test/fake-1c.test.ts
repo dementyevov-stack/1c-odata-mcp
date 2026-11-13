@@ -94,6 +94,7 @@ const OVERRIDES: Record<string, Record<string, unknown>> = {
     lines: [{ name: "Тест", quantity: 1, price: 100, nomenclatureRef: id, vatRate: "БезНДС" }],
   },
   "write.money.create_bank_writeoff": { operationKind: "ОплатаПоставщику", amount: 1 },
+  "write.money.create_payment": { counterpartyRef: id, contractRef: id, amount: 1 },
   "write.money.create_cash_payment": { operationKind: "ОплатаПоставщику", amount: 1 },
   "write.document.apply_bank_settlement_settings": {
     entitySet: "Document_ПоступлениеНаРасчетныйСчет",
@@ -129,6 +130,8 @@ function valueFor(name: string, s: Schema): unknown {
   if (/Ref$|^ref$/.test(name)) return id;
   if (name === "month") return "2026-09";
   if (/^(from|date|asOf|incomingDate)$/.test(name)) return "2026-09-01";
+  if (/^(time|incomingTime)$/.test(name)) return "12:00:00";
+  if (name === "vatRate") return "НДС20";
   if (name === "to") return "2026-09-30";
   if (name === "accountNumber") return "40702810000000000001";
   if (name === "bik") return "044525225";

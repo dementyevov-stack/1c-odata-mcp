@@ -9835,12 +9835,12 @@
             "type": "string"
           },
           "counterpartyRef": {
-            "type": "string",
-            "description": "Ref_Key покупателя"
+            "description": "Ref_Key покупателя (для обычного режима)",
+            "type": "string"
           },
           "contractRef": {
-            "type": "string",
-            "description": "Ref_Key договора"
+            "description": "Ref_Key договора (для обычного режима)",
+            "type": "string"
           },
           "operationKind": {
             "description": "Вид операции (ВидОперации). Обычно НЕ задавайте: по умолчанию «ОплатаПокупателя» или значение из настройки базы (ODATA_ACCOUNTING_CONFIG, operationKinds.customerPayment). Нужен, только если в конфигурации другое значение — не угадывайте.",
@@ -9861,6 +9861,81 @@
             "description": "Дата YYYY-MM-DD (по умолчанию сегодня)",
             "type": "string"
           },
+          "number": {
+            "description": "Исторический номер документа",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "time": {
+            "description": "Время документа",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "incomingNumber": {
+            "description": "Входящий номер",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "incomingDate": {
+            "description": "Входящая дата YYYY-MM-DD",
+            "type": "string"
+          },
+          "incomingTime": {
+            "description": "Входящее время",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "bankAccountingAccountRef": {
+            "description": "СчетБанк_Key (51)",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "settlementAccountRef": {
+            "description": "Счёт расчётов (55.03)",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "cashflowItemRef": {
+            "description": "Статья ДДС шапки",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "rowCashflowItemRef": {
+            "description": "Статья ДДС строки",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "vatRate": {
+            "description": "Историческая ставка НДС или пусто",
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "НДС20"
+              },
+              {
+                "type": "string",
+                "const": ""
+              }
+            ]
+          },
+          "usnReflection": {
+            "description": "ОтражениеВУСН",
+            "type": "string"
+          },
+          "purposeText": {
+            "description": "Назначение платежа",
+            "type": "string"
+          },
+          "comment": {
+            "description": "Комментарий",
+            "type": "string"
+          },
           "confirm": {
             "default": false,
             "description": "false (по умолчанию) — только предпросмотр (dry-run), запись НЕ выполняется. true — выполнить создание. Сначала всегда показывайте dry-run и получайте согласие пользователя; при подтверждении передавайте operationId из результата предпросмотра и те же аргументы. После таймаута повторяйте подтверждение с тем же id, не создавая новый предпросмотр.",
@@ -9874,8 +9949,6 @@
           }
         },
         "required": [
-          "counterpartyRef",
-          "contractRef",
           "amount"
         ],
         "$schema": "https://json-schema.org/draft/2020-12/schema"

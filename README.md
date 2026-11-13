@@ -304,7 +304,7 @@ Claude: (вызывает read.catalog.list_warehouses: розничные ск�
 | `write.warehouse.create_inventory` | Инвентаризация товаров на складе |
 | `write.sales.create_act` | Реализация услуг (акт) |
 | `write.sales.create_services_act` | Акт об оказании услуг (доходы/расходы по номенклатурной группе) |
-| `write.money.create_payment` / `write.money.create_payout_order` | Оплата от покупателя (поступление на р/с) / платёжное поручение |
+| `write.money.create_payment` / `write.money.create_payout_order` | Оплата от покупателя (поступление на р/с) / платёжное поручение; у поступления opt-in исторический `Депозит` с точными реквизитами, одной строкой, явной пустой/НДС20 ставкой и пустыми плательщиком/договором/аналитикой |
 | `write.money.create_bank_writeoff` | Списание с расчётного счёта (исходящий платёж, вид операции обязателен) |
 | `write.money.create_cash_receipt` / `write.money.create_cash_payment` | Приходный / расходный кассовый ордер (ПКО / РКО) |
 | `write.sales.create_issued_invoice` / `write.purchase.create_received_invoice` | Счёт-фактура выданный / полученный (на основании реализации / поступления) |
