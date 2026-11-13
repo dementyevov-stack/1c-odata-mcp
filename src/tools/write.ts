@@ -131,6 +131,15 @@ const VAT_KIND_VALUES = [
   "ПониженнаяУСНРасчетная",
 ] as const;
 
+/** Значения Enum_СпособыЗаполненияСтавкиНДС из схемы БП 3.0. */
+const VAT_METHOD_VALUES = [
+  "Автоматически",
+  "БезНДС",
+  "ИзКарточкиНоменклатуры",
+  "ОбщаяУСН",
+  "ПониженнаяУСН",
+] as const;
+
 /**
  * Ставки НДС для переноса явных исторических значений из банковской выписки. Список — из
  * Enum_СтавкиНДС БП 3.0, включая ставки до 2019 года и расчётные; неизвестное значение
@@ -2442,6 +2451,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .describe("Вид договора — ОБЯЗАТЕЛЬНО спросить у пользователя, не выбирать самому"),
         number: z.string().optional().describe("Номер договора (по умолчанию «б/н»)"),
         date: z.string().optional().describe("Дата договора YYYY-MM-DD (по умолчанию сегодня)"),
+        code: z.string().trim().min(1).max(100).optional().describe("Исторический Code договора"),
+        sumIncludesVat: z.boolean().optional().describe("Историческое СуммаВключаетНДС"),
+        contractClosed: z.boolean().optional().describe("Историческое ДоговорЗакрыт"),
+        contractSigned: z.boolean().optional().describe("Историческое ДоговорПодписан"),
+        vatMethod: z.enum(VAT_METHOD_VALUES).optional().describe("Историческое СпособЗаполненияСтавкиНДС"),
         emptyNumber: z.boolean().optional().describe("Исторический opt-in: номер явно пустой, без «б/н»"),
         emptyDate: z.boolean().optional().describe("Исторический opt-in: дата явно пустая, без текущей даты"),
         name: z.string().optional().describe("Наименование договора (по умолчанию «Договор <номер>»)"),
@@ -2472,6 +2486,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       kind,
       number,
       date,
+      code,
+      sumIncludesVat,
+      contractClosed,
+      contractSigned,
+      vatMethod,
       emptyNumber,
       emptyDate,
       name,
@@ -2485,7 +2504,14 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const conn = ctx.db(database);
         const set = await resolveSet(conn, CATALOGS.contracts, "Договоры контрагентов");
         const org = await resolveOrg(conn, organization);
-        const historical = emptyNumber === true || emptyDate === true;
+        const historical =
+          emptyNumber === true ||
+          emptyDate === true ||
+          code !== undefined ||
+          sumIncludesVat !== undefined ||
+          contractClosed !== undefined ||
+          contractSigned !== undefined ||
+          vatMethod !== undefined;
         if (historical) {
           if (!name) throw new InputError("Исторический договор требует явное name.");
           if (emptyNumber && number !== undefined)
@@ -2509,6 +2535,13 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ["ВидДоговора", "Edm.String"],
           ] as const)
             need(field, type);
+          if (code !== undefined) need("Code", "Edm.String");
+          if (sumIncludesVat !== undefined) need("СуммаВключаетНДС", "Edm.Boolean");
+          if (contractClosed !== undefined) need("ДоговорЗакрыт", "Edm.Boolean");
+          if (contractSigned !== undefined) need("ДоговорПодписан", "Edm.Boolean");
+          if (vatMethod !== undefined) need("СпособЗаполненияСтавкиНДС", "Edm.String");
+          need("IsFolder", "Edm.Boolean");
+          need("DeletionMark", "Edm.Boolean");
           if (currency) {
             need("ВалютаВзаиморасчетов_Key", "Edm.Guid");
             need("Валютный", "Edm.Boolean");
@@ -2602,6 +2635,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           Description: name ?? `Договор ${num}`,
           ...(emptyNumber ? {} : { Номер: num }),
           ...(emptyDate ? {} : { Дата: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()) }),
+          ...(code !== undefined ? { Code: code } : {}),
+          ...(sumIncludesVat !== undefined ? { СуммаВключаетНДС: sumIncludesVat } : {}),
+          ...(contractClosed !== undefined ? { ДоговорЗакрыт: contractClosed } : {}),
+          ...(contractSigned !== undefined ? { ДоговорПодписан: contractSigned } : {}),
+          ...(vatMethod !== undefined ? { СпособЗаполненияСтавкиНДС: vatMethod } : {}),
           Owner_Key: counterpartyRef,
           ВидДоговора: kind,
           Организация_Key: org.key,
@@ -2612,7 +2650,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(foreign !== undefined ? { Валютный: foreign } : {}),
         }) as Record<string, unknown>;
         if (emptyNumber) payload["Номер"] = "";
-        if (emptyDate) payload["Дата"] = null;
+        if (emptyDate) payload["Дата"] = "0001-01-01T00:00:00";
         let effectivePayload = payload;
         const created = await createOrPreview(conn, set, payload, confirm, undefined, {
           prepared: (prepared) => {
@@ -2624,7 +2662,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             return withStructured(created, {
               emptyFields: [...(emptyNumber ? ["Номер"] : []), ...(emptyDate ? ["Дата"] : [])],
               ...(emptyDate
-                ? { emptyDateNote: "Дата отправлена как null; контрольный GET проверит пустое значение." }
+                ? {
+                    emptyDateNote:
+                      "Дата отправлена как 0001-01-01T00:00:00; контрольный GET проверит это значение.",
+                  }
                 : {}),
             });
           return created;
@@ -2649,7 +2690,14 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const fields: Record<string, unknown> = {
           Description: effectivePayload["Description"],
           ...(emptyNumber ? { Номер: "" } : { Номер: effectivePayload["Номер"] }),
-          ...(emptyDate ? { Дата: null } : { Дата: effectivePayload["Дата"] }),
+          ...(emptyDate ? { Дата: "0001-01-01T00:00:00" } : { Дата: effectivePayload["Дата"] }),
+          ...(code !== undefined ? { Code: code } : {}),
+          ...(sumIncludesVat !== undefined ? { СуммаВключаетНДС: sumIncludesVat } : {}),
+          ...(contractClosed !== undefined ? { ДоговорЗакрыт: contractClosed } : {}),
+          ...(contractSigned !== undefined ? { ДоговорПодписан: contractSigned } : {}),
+          ...(vatMethod !== undefined ? { СпособЗаполненияСтавкиНДС: vatMethod } : {}),
+          IsFolder: false,
+          DeletionMark: false,
           Owner_Key: counterpartyRef,
           Организация_Key: org.key,
           ВидДоговора: kind,
@@ -2663,13 +2711,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
         );
         const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
-        const dateEmpty = (v: unknown): boolean =>
-          v === null || v === undefined || v === "" || String(v).startsWith("0001-01-01");
         for (const [field, expected] of Object.entries(fields)) {
+          const type = types.get(field) ?? "Edm.String";
           const ok =
             field === "Дата" && emptyDate
-              ? dateEmpty(actual[field])
-              : sameStoredValue(expected, actual[field], types.get(field) ?? "Edm.String");
+              ? String(actual[field] ?? "") === "0001-01-01T00:00:00"
+              : sameStoredValue(expected, actual[field], type);
           if (!ok) mismatches.push({ field, expected, actual: actual[field] });
         }
         if (mismatches.length)

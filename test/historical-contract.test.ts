@@ -77,7 +77,7 @@ describe("write.catalog.create_contract: исторический opt-in", () =>
     expect(payload).toMatchObject({
       Description: "Основной договор",
       Номер: "",
-      Дата: null,
+      Дата: "0001-01-01T00:00:00",
       Owner_Key: CP,
       Организация_Key: ORG,
       ВидДоговора: "Прочее",
@@ -89,18 +89,60 @@ describe("write.catalog.create_contract: исторический opt-in", () =>
     expect(postCount(fake)).toBe(0);
   });
 
+  it("переносит Code, СуммаВключаетНДС, флаги и способ ставки НДС", async () => {
+    const { client, fake } = await setup();
+    const preview = await call(client, {
+      ...base,
+      code: "HIST-001",
+      sumIncludesVat: true,
+      contractClosed: false,
+      contractSigned: false,
+      vatMethod: "Автоматически",
+      confirm: false,
+    });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      Code: "HIST-001",
+      СуммаВключаетНДС: true,
+      ДоговорЗакрыт: false,
+      ДоговорПодписан: false,
+      СпособЗаполненияСтавкиНДС: "Автоматически",
+    });
+    expect(postCount(fake)).toBe(0);
+  });
+
   it("подтверждает и сверяет все отправленные поля; дата 0001-01-01 считается пустой", async () => {
     const { client, fake } = await setup({ readbackDate: "0001-01-01T00:00:00" });
-    const preview = await call(client, { ...base, confirm: false });
+    const args = {
+      ...base,
+      code: "HIST-001",
+      sumIncludesVat: true,
+      contractClosed: false,
+      contractSigned: false,
+      vatMethod: "Автоматически",
+    };
+    const preview = await call(client, { ...args, confirm: false });
     const operationId = preview.structuredContent?.operationId;
     expect(typeof operationId).toBe("string");
-    const created = await call(client, { ...base, confirm: true, operationId });
+    const created = await call(client, { ...args, confirm: true, operationId });
     expect(created.isError, JSON.stringify(created)).toBeFalsy();
     expect(created.structuredContent).toMatchObject({
       created: true,
       verification: "ok",
       emptyFields: ["Номер", "Дата"],
     });
+    expect(created.structuredContent?.verifiedFields).toEqual(
+      expect.arrayContaining([
+        "Code",
+        "СуммаВключаетНДС",
+        "ДоговорЗакрыт",
+        "ДоговорПодписан",
+        "СпособЗаполненияСтавкиНДС",
+        "IsFolder",
+        "DeletionMark",
+      ]),
+    );
     expect(postCount(fake)).toBe(1);
   });
 

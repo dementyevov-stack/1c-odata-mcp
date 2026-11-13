@@ -6647,6 +6647,35 @@
             "description": "Дата договора YYYY-MM-DD (по умолчанию сегодня)",
             "type": "string"
           },
+          "code": {
+            "description": "Исторический Code договора",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "sumIncludesVat": {
+            "description": "Историческое СуммаВключаетНДС",
+            "type": "boolean"
+          },
+          "contractClosed": {
+            "description": "Историческое ДоговорЗакрыт",
+            "type": "boolean"
+          },
+          "contractSigned": {
+            "description": "Историческое ДоговорПодписан",
+            "type": "boolean"
+          },
+          "vatMethod": {
+            "description": "Историческое СпособЗаполненияСтавкиНДС",
+            "type": "string",
+            "enum": [
+              "Автоматически",
+              "БезНДС",
+              "ИзКарточкиНоменклатуры",
+              "ОбщаяУСН",
+              "ПониженнаяУСН"
+            ]
+          },
           "emptyNumber": {
             "description": "Исторический opt-in: номер явно пустой, без «б/н»",
             "type": "boolean"
