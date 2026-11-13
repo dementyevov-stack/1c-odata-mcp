@@ -298,7 +298,7 @@ Claude: (вызывает read.catalog.list_warehouses: розничные ск�
 | `write.catalog.create_nomenclature` | Номенклатура (папка, артикул, признак услуги); opt-in исторические `Code`, вид, единица, номенклатурная группа и `ВидСтавкиНДС` с проверкой дубля и readback |
 | `write.catalog.create_contract` | Договор (вид, номер, валюта, тип цен, руководитель контрагента) |
 | `write.sales.create_invoice` / `write.purchase.create_supplier_invoice` | Счёт покупателю / счёт на оплату поставщика (непроведёнными); у счёта покупателю opt-in исторический номер/время, явные сумма/НДС строки и исторические ставки; `emptyQuantity` не отправляет количество (сумма/НДС обязательны, readback pending), при `sumIncludesVat=false` исторический итог документа считается как net+VAT. Срок оплаты не поддержан |
-| `write.purchase.create_purchase` / `write.sales.create_shipment` | Поступление от поставщика / реализация покупателю |
+| `write.purchase.create_purchase` / `write.sales.create_shipment` | Поступление от поставщика / реализация покупателю; у поступления opt-in исторические Number/Date, входящие реквизиты, склад в шапке при пустом складе строки, net/VAT/gross, счета 60.01/60.02 и товара/НДС, флаг УПД и readback |
 | `write.warehouse.create_return_from_customer` / `write.warehouse.create_return_to_supplier` | Возврат товаров от покупателя / поставщику |
 | `write.warehouse.create_transfer` | Перемещение товаров между складами |
 | `write.warehouse.create_surplus` / `write.warehouse.create_writeoff` | Оприходование / списание товаров |

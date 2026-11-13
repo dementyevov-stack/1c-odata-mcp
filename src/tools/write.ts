@@ -3079,6 +3079,17 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
   /** Реализация: та же схема плюс банковский счёт организации (у возврата его нет). */
   const shipmentDocInput = { ...salesDocInput, orgBankAccount: orgBankAccountField };
 
+  const historicalPurchaseLine = z.object({
+    ...baseLineShape,
+    vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические"),
+    amount: z.number().nonnegative().optional().describe("Явная сумма строки без НДС"),
+    vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
+    sourceLineId: z.string().trim().min(1).max(200).optional().describe("ИдентификаторСтроки источника"),
+    inventoryAccountRef: z.string().uuid().optional().describe("Ref_Key счёта учёта товара"),
+    vatAccountRef: z.string().uuid().optional().describe("Ref_Key счёта учёта входящего НДС"),
+    warehouseEmpty: z.boolean().optional().describe("Opt-in: склад строки пустой (склад только в шапке)"),
+  });
+
   server.registerTool(
     "write.purchase.create_purchase",
     {
@@ -3087,8 +3098,33 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "Создаёт документ «Поступление товаров и услуг» (закупка у поставщика) с табличной частью «Товары». " +
         "Документ НЕПРОВЕДЁННЫЙ; провести — вручную в 1С или post_document (тогда 1С сформирует проводки Дт 41/19 Кт 60; счёт расчётов — по настройке договора, источник виден в предпросмотре). " +
         "Позиции могут нести content (Содержание строки) — для услуг вроде доставки. " +
+        "Исторический opt-in: собственные Number/Date с секундами, входящие номер/дата, поставщик и договор, " +
+        "склад в шапке при пустом складе строки, net/VAT/gross, идентификатор строки, счета расчётов/авансов, " +
+        "товара и входящего НДС, флаг УПД; с контролем дубля и полным readback. " +
         "По умолчанию dry-run; создание — при confirm=true. Контрагент — поставщик, договор — вида «СПоставщиком».",
-      inputSchema: z.object(purchaseDocInput),
+      inputSchema: z.object({
+        ...goodsDocCommon,
+        number: z.string().trim().min(1).max(100).optional().describe("Собственный номер документа"),
+        time: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Точное время документа HH:MM:SS"),
+        comment: z.string().trim().min(1).max(1000).optional().describe("Комментарий шапки"),
+        incomingNumber: z.string().trim().min(1).max(100).optional().describe("Номер входящего документа"),
+        incomingDate: z.string().optional().describe("Дата входящего документа YYYY-MM-DD"),
+        incomingTime: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Время входящего документа HH:MM:SS"),
+        documentTotal: z.number().nonnegative().optional().describe("Точный gross итог документа"),
+        settlementAccountRef: z.string().uuid().optional().describe("Ref_Key счёта расчётов (60.01)"),
+        advanceAccountRef: z.string().uuid().optional().describe("Ref_Key счёта авансов (60.02)"),
+        universalDocument: z.boolean().optional().describe("ЭтоУниверсальныйДокумент"),
+        lines: z.array(historicalPurchaseLine).min(1).describe("Позиции документа"),
+        confirm: confirmField,
+      }),
       outputSchema: createResultSchema,
     },
     ({
@@ -3098,6 +3134,16 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       contractRef,
       warehouse,
       date,
+      number,
+      time,
+      comment,
+      incomingNumber,
+      incomingDate,
+      incomingTime,
+      documentTotal,
+      settlementAccountRef,
+      advanceAccountRef,
+      universalDocument,
       sumIncludesVat,
       lines,
       confirm,
@@ -3110,24 +3156,313 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           "Документ «Поступление товаров и услуг»",
         );
         const org = await resolveOrg(conn, organization);
+        const historical =
+          number !== undefined ||
+          time !== undefined ||
+          comment !== undefined ||
+          incomingNumber !== undefined ||
+          incomingDate !== undefined ||
+          incomingTime !== undefined ||
+          documentTotal !== undefined ||
+          settlementAccountRef !== undefined ||
+          advanceAccountRef !== undefined ||
+          universalDocument !== undefined ||
+          lines.some(
+            (line) =>
+              line.amount !== undefined ||
+              line.vatAmount !== undefined ||
+              line.sourceLineId !== undefined ||
+              line.inventoryAccountRef !== undefined ||
+              line.vatAccountRef !== undefined ||
+              line.warehouseEmpty === true ||
+              !(VAT_RATES as readonly string[]).includes(line.vatRate ?? "БезНДС"),
+          );
+        if (!historical) {
+          const warehouseKey = await resolveWarehouse(conn, warehouse);
+          const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "purchase");
+          return createGoodsDoc(
+            conn,
+            set,
+            {
+              orgKey: org.key,
+              counterpartyRef,
+              contractRef,
+              warehouseKey,
+              date,
+              sumIncludesVat,
+              lines,
+              settlement,
+              lineAccountsFor,
+            },
+            confirm,
+          );
+        }
+        if (!number) throw new InputError("Историческое поступление требует явный number.");
+        if (!date && !time) throw new InputError("Историческое поступление требует явную date.");
+        if (!contractRef) throw new InputError("Историческое поступление требует явный contractRef.");
+        if (!warehouse) throw new InputError("Историческое поступление требует явный warehouse (Ref_Key).");
+        await resolveCustomerContract(conn, { orgKey: org.key, counterpartyRef, contractRef });
         const warehouseKey = await resolveWarehouse(conn, warehouse);
-        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "purchase");
-        return createGoodsDoc(
-          conn,
-          set,
-          {
-            orgKey: org.key,
-            counterpartyRef,
-            contractRef,
-            warehouseKey,
-            date,
-            sumIncludesVat,
-            lines,
-            settlement,
-            lineAccountsFor,
-          },
-          confirm,
+        if (!warehouseKey) throw new InputError("Склад не найден.");
+        const props = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
         );
+        const rowProps = new Map(
+          (await conn.getMetadata()).entities.get(`${set}_Товары`)?.properties.map((p) => [p.name, p.type]) ??
+            [],
+        );
+        const need = (field: string, type: string): void => {
+          if (props.get(field) !== type)
+            throw new InputError(`Схема поступления не публикует ${field} с типом ${type}.`);
+        };
+        const needRow = (field: string, type: string): void => {
+          if (rowProps.get(field) !== type)
+            throw new InputError(`Схема строки поступления не публикует ${field} с типом ${type}.`);
+        };
+        for (const [field, type] of [
+          ["Number", "Edm.String"],
+          ["Date", "Edm.DateTime"],
+          ["ВидОперации", "Edm.String"],
+          ["Организация_Key", "Edm.Guid"],
+          ["Склад_Key", "Edm.Guid"],
+          ["Контрагент_Key", "Edm.Guid"],
+          ["ДоговорКонтрагента_Key", "Edm.Guid"],
+          ["НомерВходящегоДокумента", "Edm.String"],
+          ["ДатаВходящегоДокумента", "Edm.DateTime"],
+          ["СуммаВключаетНДС", "Edm.Boolean"],
+          ["СуммаДокумента", "Edm.Double"],
+          ["Posted", "Edm.Boolean"],
+          ["DeletionMark", "Edm.Boolean"],
+        ] as const)
+          need(field, type);
+        if (universalDocument !== undefined) need("ЭтоУниверсальныйДокумент", "Edm.Boolean");
+        if (settlementAccountRef !== undefined) need("СчетУчетаРасчетовСКонтрагентом_Key", "Edm.Guid");
+        if (advanceAccountRef !== undefined) need("СчетУчетаРасчетовПоАвансам_Key", "Edm.Guid");
+        for (const [field, type] of [
+          ["Номенклатура_Key", "Edm.Guid"],
+          ["Количество", "Edm.Double"],
+          ["Цена", "Edm.Double"],
+          ["Сумма", "Edm.Double"],
+          ["СтавкаНДС", "Edm.String"],
+          ["СуммаНДС", "Edm.Double"],
+          ["СчетУчета_Key", "Edm.Guid"],
+          ["СчетУчетаНДС_Key", "Edm.Guid"],
+        ] as const)
+          needRow(field, type);
+        if (lines.some((l) => l.sourceLineId !== undefined)) needRow("ИдентификаторСтроки", "Edm.String");
+        if (lines.some((l) => l.content !== undefined)) needRow("Содержание", "Edm.String");
+        if (lines.some((l) => l.warehouseEmpty === true)) needRow("Склад_Key", "Edm.Guid");
+        const refs = [
+          settlementAccountRef,
+          advanceAccountRef,
+          ...lines.flatMap((l) => [l.inventoryAccountRef, l.vatAccountRef]),
+        ].filter((r): r is string => Boolean(r));
+        if (refs.length) await accountsByRef(conn, [...new Set(refs)]);
+        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "purchase");
+        const rows = lines.map((l, i) => {
+          const defaults = lineAccountsFor(l);
+          return clean({
+            ...(l.sourceLineId !== undefined ? { ИдентификаторСтроки: l.sourceLineId } : {}),
+            LineNumber: i + 1,
+            Номенклатура_Key: l.nomenclatureRef,
+            ...(l.content === undefined ? {} : { Содержание: l.content }),
+            Количество: l.quantity,
+            Цена: l.price,
+            Сумма: l.amount ?? lineSum(l),
+            СтавкаНДС: l.vatRate,
+            ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
+            СчетУчета_Key: l.inventoryAccountRef ?? defaults["СчетУчета_Key"],
+            СчетУчетаНДС_Key: l.vatAccountRef ?? defaults["СчетУчетаНДС_Key"],
+            // Склад строки явно пустой: склад задаётся только в шапке.
+          });
+        });
+        const netTotal =
+          Math.round(rows.reduce((sum, row) => sum + Number(row["Сумма"] ?? 0), 0) * 100) / 100;
+        const vatTotal =
+          Math.round(rows.reduce((sum, row) => sum + Number(row["СуммаНДС"] ?? 0), 0) * 100) / 100;
+        const total =
+          documentTotal ?? (sumIncludesVat ? netTotal : Math.round((netTotal + vatTotal) * 100) / 100);
+        const now = new Date();
+        const day = date ?? odataDate(now).slice(0, 10);
+        const documentDate = time ? new Date(`${day}T${time}`) : date ? new Date(`${date}T00:00:00`) : now;
+        const incoming = incomingDate
+          ? odataDate(new Date(`${incomingDate}T${incomingTime ?? "00:00:00"}`))
+          : undefined;
+        // Защита от дубля: номер + организация + год.
+        {
+          const select = ["Ref_Key", "Number", "Date", "Организация_Key"];
+          let found: ODataEntity[];
+          let truncated: boolean;
+          try {
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              {
+                filter: and(
+                  cmp("Number", "eq", odataString(number)),
+                  cmp("Организация_Key", "eq", odataGuid(org.key)),
+                ),
+                select,
+              },
+              conn.behavior.pageSize,
+              200,
+            );
+            found = read.rows;
+            truncated = read.truncated;
+          } catch (error) {
+            if (!(error instanceof ODataError && error.status === 500)) throw error;
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              { select },
+              conn.behavior.pageSize,
+              5_000,
+            );
+            found = read.rows;
+            truncated = read.truncated;
+          }
+          if (truncated) throw new InputError("Проверка дубля поступления: достигнут предел строк.");
+          const year = String(odataDate(documentDate)).slice(0, 4);
+          const conflict = found.find(
+            (r) =>
+              String(r["Number"] ?? "").trim() === number &&
+              String(r["Организация_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() === org.key.toLowerCase() &&
+              String(r["Date"] ?? "").slice(0, 4) === year,
+          );
+          if (conflict)
+            throw new InputError(
+              `Номер «${number}» уже занят документом ${String(conflict["Ref_Key"] ?? "")} за ${year} год.`,
+            );
+        }
+        const payload = clean({
+          Date: odataDate(documentDate),
+          Number: number.trim(),
+          ВидОперации: "Товары",
+          Posted: false,
+          Организация_Key: org.key,
+          Склад_Key: warehouseKey,
+          Контрагент_Key: counterpartyRef,
+          ДоговорКонтрагента_Key: contractRef,
+          ...(comment !== undefined ? { Комментарий: comment } : {}),
+          ...(incomingNumber !== undefined ? { НомерВходящегоДокумента: incomingNumber } : {}),
+          ...(incoming !== undefined ? { ДатаВходящегоДокумента: incoming } : {}),
+          ...(settlementAccountRef
+            ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef }
+            : { СчетУчетаРасчетовСКонтрагентом_Key: settlement }),
+          ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
+          ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
+          СуммаВключаетНДС: sumIncludesVat,
+          СуммаДокумента: total,
+          Товары: rows,
+        });
+        let effectivePayload = payload;
+        const created = await createOrPreview(conn, set, payload, confirm, undefined, {
+          prepared: (prepared) => {
+            effectivePayload = prepared;
+          },
+        });
+        if (!confirm || created.isError) return created;
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+        if (!ref) return created;
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch {
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              {
+                type: "text",
+                text: "Поступление создано, но контрольное чтение не удалось; повтор запрещён.",
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed" },
+          };
+        }
+        const expectedHeader: Record<string, unknown> = {
+          Date: effectivePayload["Date"],
+          Number: effectivePayload["Number"],
+          ВидОперации: "Товары",
+          Posted: false,
+          DeletionMark: false,
+          Организация_Key: org.key,
+          Склад_Key: warehouseKey,
+          Контрагент_Key: counterpartyRef,
+          ДоговорКонтрагента_Key: contractRef,
+          ...(comment !== undefined ? { Комментарий: effectivePayload["Комментарий"] } : {}),
+          ...(incomingNumber !== undefined ? { НомерВходящегоДокумента: incomingNumber } : {}),
+          ...(incoming !== undefined ? { ДатаВходящегоДокумента: incoming } : {}),
+          ...(settlementAccountRef ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef } : {}),
+          ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
+          ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
+          СуммаВключаетНДС: sumIncludesVat,
+          СуммаДокумента: total,
+        };
+        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
+        const types = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        for (const [field, value] of Object.entries(expectedHeader))
+          if (!sameStoredValue(value, actual[field], types.get(field) ?? "Edm.String"))
+            mismatches.push({ field, expected: value, actual: actual[field] });
+        const actualRows = actual["Товары"];
+        if (!Array.isArray(actualRows) || actualRows.length !== rows.length)
+          mismatches.push({
+            field: "Товары",
+            expected: `строк: ${rows.length}`,
+            actual: Array.isArray(actualRows) ? `строк: ${actualRows.length}` : "нет таблицы",
+          });
+        else {
+          const rowTypes = new Map(
+            (await conn.getMetadata()).entities
+              .get(`${set}_Товары`)
+              ?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          rows.forEach((expected, index) => {
+            const actualRow = actualRows[index] as Record<string, unknown>;
+            for (const [field, value] of Object.entries(expected))
+              if (!sameStoredValue(value, actualRow[field], rowTypes.get(field) ?? "Edm.String"))
+                mismatches.push({
+                  field: `Товары[${index + 1}].${field}`,
+                  expected: value,
+                  actual: actualRow[field],
+                });
+            if (
+              actualRow["Склад_Key"] != null &&
+              String(actualRow["Склад_Key"]).replace(/[{}]/g, "") !== EMPTY_GUID
+            )
+              mismatches.push({
+                field: `Товары[${index + 1}].Склад_Key`,
+                expected: null,
+                actual: actualRow["Склад_Key"],
+              });
+          });
+        }
+        if (mismatches.length)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text: `Поступление создано (Ref_Key ${ref}), но контрольное чтение не подтвердило: ${mismatches.map((m) => m.field).join(", ")}. Повтор запрещён.`,
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed", mismatches },
+          };
+        return withStructured(created, {
+          verification: "ok",
+          verifiedFields: [
+            ...Object.keys(expectedHeader),
+            ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Товары[${i + 1}].${field}`)),
+          ],
+        });
       }),
   );
 

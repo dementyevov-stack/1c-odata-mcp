@@ -7435,7 +7435,7 @@
     {
       "name": "write.purchase.create_purchase",
       "title": "Создать поступление от поставщика",
-      "description": "Создаёт документ «Поступление товаров и услуг» (закупка у поставщика) с табличной частью «Товары». Документ НЕПРОВЕДЁННЫЙ; провести — вручную в 1С или post_document (тогда 1С сформирует проводки Дт 41/19 Кт 60; счёт расчётов — по настройке договора, источник виден в предпросмотре). Позиции могут нести content (Содержание строки) — для услуг вроде доставки. По умолчанию dry-run; создание — при confirm=true. Контрагент — поставщик, договор — вида «СПоставщиком».",
+      "description": "Создаёт документ «Поступление товаров и услуг» (закупка у поставщика) с табличной частью «Товары». Документ НЕПРОВЕДЁННЫЙ; провести — вручную в 1С или post_document (тогда 1С сформирует проводки Дт 41/19 Кт 60; счёт расчётов — по настройке договора, источник виден в предпросмотре). Позиции могут нести content (Содержание строки) — для услуг вроде доставки. Исторический opt-in: собственные Number/Date с секундами, входящие номер/дата, поставщик и договор, склад в шапке при пустом складе строки, net/VAT/gross, идентификатор строки, счета расчётов/авансов, товара и входящего НДС, флаг УПД; с контролем дубля и полным readback. По умолчанию dry-run; создание — при confirm=true. Контрагент — поставщик, договор — вида «СПоставщиком».",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -7468,6 +7468,59 @@
             "description": "Сумма включает НДС",
             "type": "boolean"
           },
+          "number": {
+            "description": "Собственный номер документа",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "time": {
+            "description": "Точное время документа HH:MM:SS",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "comment": {
+            "description": "Комментарий шапки",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "incomingNumber": {
+            "description": "Номер входящего документа",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "incomingDate": {
+            "description": "Дата входящего документа YYYY-MM-DD",
+            "type": "string"
+          },
+          "incomingTime": {
+            "description": "Время входящего документа HH:MM:SS",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "documentTotal": {
+            "description": "Точный gross итог документа",
+            "type": "number",
+            "minimum": 0
+          },
+          "settlementAccountRef": {
+            "description": "Ref_Key счёта расчётов (60.01)",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "advanceAccountRef": {
+            "description": "Ref_Key счёта авансов (60.02)",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "universalDocument": {
+            "description": "ЭтоУниверсальныйДокумент",
+            "type": "boolean"
+          },
           "lines": {
             "minItems": 1,
             "type": "array",
@@ -7490,21 +7543,60 @@
                 },
                 "vatRate": {
                   "default": "БезНДС",
-                  "description": "Ставка НДС",
+                  "description": "Ставка НДС, включая исторические",
                   "type": "string",
                   "enum": [
                     "БезНДС",
                     "НДС0",
                     "НДС5",
+                    "НДС5_105",
                     "НДС7",
+                    "НДС7_107",
                     "НДС10",
+                    "НДС10_110",
+                    "НДС18",
+                    "НДС18_118",
                     "НДС20",
-                    "НДС22"
+                    "НДС20_120",
+                    "НДС22",
+                    "НДС22_122"
                   ]
                 },
                 "content": {
                   "description": "Содержание строки (реквизит «Содержание») — именно этот текст печатается в счёте и УПД. Для услуг заполняйте обязательно, напр. «Услуги согласно приложению № 4 от 01.10.2025 г. к договору № 87 от 01.12.2023 г. за июль 2026 г.». 1С сама это поле НЕ заполняет.",
                   "type": "string"
+                },
+                "amount": {
+                  "description": "Явная сумма строки без НДС",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "vatAmount": {
+                  "description": "Явная сумма НДС строки",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "sourceLineId": {
+                  "description": "ИдентификаторСтроки источника",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "inventoryAccountRef": {
+                  "description": "Ref_Key счёта учёта товара",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "vatAccountRef": {
+                  "description": "Ref_Key счёта учёта входящего НДС",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "warehouseEmpty": {
+                  "description": "Opt-in: склад строки пустой (склад только в шапке)",
+                  "type": "boolean"
                 }
               },
               "required": [
