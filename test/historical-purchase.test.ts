@@ -18,7 +18,9 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((fn) => fn().catch(() => undefined)));
 });
 
-async function setup(options: { documents?: Record<string, unknown>[]; rowWarehouse?: string } = {}) {
+async function setup(
+  options: { documents?: Record<string, unknown>[]; rowWarehouse?: string; contractKind?: string } = {},
+) {
   const data = (q: FakeQuery): Record<string, unknown>[] | undefined =>
     q.base === "Document_ПоступлениеТоваровУслуг" ? (options.documents ?? []) : undefined;
   const fake = fake1C({ READ_ONLY: "false", ODATA_WRITABLE: "true" }, { data });
@@ -29,7 +31,7 @@ async function setup(options: { documents?: Record<string, unknown>[]; rowWareho
         Ref_Key: CTR,
         Owner_Key: CP,
         Организация_Key: ORG,
-        ВидДоговора: "СПоставщиком",
+        ВидДоговора: options.contractKind ?? "СПоставщиком",
         DeletionMark: false,
       };
     if (path.startsWith("Document_ПоступлениеТоваровУслуг(") && !path.includes("$select")) {
@@ -161,6 +163,26 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
     expect(created.isError).toBe(true);
     expect(JSON.stringify(created)).toContain("Склад_Key");
     expect(JSON.stringify(created)).toContain("Ref_Key");
+  });
+
+  it("договор СПоставщиком принимается, СПокупателем — отклоняется", async () => {
+    const supplier = await setup();
+    const ok = await call(supplier.client, { ...args, confirm: false });
+    expect(ok.isError, JSON.stringify(ok)).toBeFalsy();
+
+    const customer = await setup({ contractKind: "СПокупателем" });
+    const bad = await call(customer.client, { ...args, confirm: false });
+    expect(bad.isError).toBe(true);
+    expect(JSON.stringify(bad)).toContain("СПокупателем");
+    expect(postCount(customer.fake)).toBe(0);
+  });
+
+  it("time без date не подставляет текущую дату", async () => {
+    const { client, fake } = await setup();
+    const result = await call(client, { ...args, date: undefined, confirm: false });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).toContain("date");
+    expect(postCount(fake)).toBe(0);
   });
 
   it("дубль номера в том же году блокирует POST", async () => {

@@ -3198,10 +3198,19 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           );
         }
         if (!number) throw new InputError("Историческое поступление требует явный number.");
-        if (!date && !time) throw new InputError("Историческое поступление требует явную date.");
+        if (!date)
+          throw new InputError(
+            "Историческое поступление требует явную date; time без date не подставляет текущую дату.",
+          );
         if (!contractRef) throw new InputError("Историческое поступление требует явный contractRef.");
         if (!warehouse) throw new InputError("Историческое поступление требует явный warehouse (Ref_Key).");
-        await resolveCustomerContract(conn, { orgKey: org.key, counterpartyRef, contractRef });
+        const contract = await resolveCustomerContract(conn, {
+          orgKey: org.key,
+          counterpartyRef,
+          contractRef,
+        });
+        if (contract.kind === "СПокупателем")
+          throw new InputError("Договор поставщика не может быть вида «СПокупателем»; нужен «СПоставщиком».");
         const warehouseKey = await resolveWarehouse(conn, warehouse);
         if (!warehouseKey) throw new InputError("Склад не найден.");
         const props = new Map(
