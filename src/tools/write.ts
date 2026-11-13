@@ -4122,6 +4122,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           need("Date", "Edm.DateTime");
           need("СуммаДокумента", "Edm.Double");
           need("СуммаВключаетНДС", "Edm.Boolean");
+          need("Posted", "Edm.Boolean");
+          need("DeletionMark", "Edm.Boolean");
+          need("ВидОперации", "Edm.String");
           needRow("Номенклатура_Key", "Edm.Guid");
           needRow("Сумма", "Edm.Double");
           needRow("Цена", "Edm.Double");
@@ -4313,7 +4316,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef }
             : { СчетУчетаРасчетовСКонтрагентом_Key: settlement }),
           ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
-          ...(bank ? { БанковскийСчетОрганизации_Key: bank } : {}),
+          ...(orgBankAccountEmpty
+            ? { БанковскийСчетОрганизации_Key: EMPTY_GUID }
+            : bank
+              ? { БанковскийСчетОрганизации_Key: bank }
+              : {}),
           ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
           ...(electronicDocumentType !== undefined
             ? { ВидЭлектронногоДокумента: electronicDocumentType }
@@ -4368,7 +4375,14 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ДоговорКонтрагента_Key: effectivePayload["ДоговорКонтрагента_Key"],
           ...(settlementAccountRef ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef } : {}),
           ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
-          ...(orgBankAccountEmpty ? {} : bank ? { БанковскийСчетОрганизации_Key: bank } : {}),
+          ...(orgBankAccountEmpty
+            ? { БанковскийСчетОрганизации_Key: EMPTY_GUID }
+            : bank
+              ? { БанковскийСчетОрганизации_Key: bank }
+              : {}),
+          Posted: false,
+          DeletionMark: false,
+          ВидОперации: effectivePayload["ВидОперации"],
           ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
           ...(electronicDocumentType !== undefined
             ? { ВидЭлектронногоДокумента: electronicDocumentType }
@@ -4399,7 +4413,6 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           rows.forEach((expected, index) => {
             const actualRow = actualRows[index] as Record<string, unknown>;
             for (const [field, value] of Object.entries(expected)) {
-              if (field === "Субконто_Type") continue;
               if (!sameStoredValue(value, actualRow[field], rowTypes.get(field) ?? "Edm.String"))
                 mismatches.push({
                   field: `Услуги[${index + 1}].${field}`,

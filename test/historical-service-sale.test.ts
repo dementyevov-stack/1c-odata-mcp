@@ -15,6 +15,7 @@ const ACC = "11111111-1111-4111-8111-111111111111";
 const NOM = "55555555-5555-4555-8555-555555555555";
 const GROUP = "66666666-6666-4666-8666-666666666666";
 const DOC = "99999999-9999-4999-8999-999999999999";
+const EMPTY_GUID = "00000000-0000-0000-0000-000000000000";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -26,6 +27,8 @@ interface Options {
   documents?: Record<string, unknown>[];
   missingUniversalField?: boolean;
   bankOwner?: string;
+  autoBankAccount?: string;
+  stringLineNumber?: boolean;
 }
 
 async function setup(options: Options = {}) {
@@ -44,6 +47,24 @@ async function setup(options: Options = {}) {
         DeletionMark: false,
       };
     if (path.startsWith("Catalog_НоменклатурныеГруппы(")) return { Ref_Key: GROUP, DeletionMark: false };
+    if (
+      (options.autoBankAccount || options.stringLineNumber) &&
+      path.startsWith("Document_РеализацияТоваровУслуг(") &&
+      !path.includes("$select")
+    ) {
+      const actual = await originalGetEntity(path);
+      const rows = (actual["Услуги"] as Array<Record<string, unknown>>).map((row) => ({
+        ...row,
+        LineNumber: options.stringLineNumber ? String(row["LineNumber"]) : row["LineNumber"],
+      }));
+      return {
+        ...actual,
+        Posted: false,
+        DeletionMark: false,
+        ...(options.autoBankAccount ? { БанковскийСчетОрганизации_Key: options.autoBankAccount } : {}),
+        Услуги: rows,
+      };
+    }
     return originalGetEntity(path);
   });
   if (options.missingUniversalField) {
@@ -128,7 +149,7 @@ describe("write.sales.create_act: исторический opt-in", () => {
       СчетУчетаРасчетовСКонтрагентом_Key: ACC,
       СчетУчетаРасчетовПоАвансам_Key: ACC,
     });
-    expect(payload).not.toHaveProperty("БанковскийСчетОрганизации_Key");
+    expect(payload).toMatchObject({ БанковскийСчетОрганизации_Key: EMPTY_GUID });
     expect(payload).not.toHaveProperty("ВидЭлектронногоДокумента");
     const row = (payload["Услуги"] as Array<Record<string, unknown>>)[0]!;
     expect(row).not.toHaveProperty("Количество");
@@ -164,6 +185,9 @@ describe("write.sales.create_act: исторический opt-in", () => {
       verification: "ok",
       quantityVerification: "pending_live_validation",
     });
+    expect(created.structuredContent?.verifiedFields).toEqual(
+      expect.arrayContaining(["Posted", "DeletionMark", "ВидОперации", "Услуги[1].Субконто_Type"]),
+    );
     expect(postCount(fake)).toBe(1);
   });
 
@@ -206,6 +230,38 @@ describe("write.sales.create_act: исторический opt-in", () => {
     expect(payload).toMatchObject({ ЭтоУниверсальныйДокумент: false });
     expect(payload).not.toHaveProperty("ВидЭлектронногоДокумента");
     expect(postCount(fake)).toBe(0);
+  });
+
+  it("автоназначение непустого счёта ломает readback: failed, Ref_Key, без второго POST", async () => {
+    const { client, fake } = await setup({ autoBankAccount: ACC });
+    const preview = await call(client, "write.sales.create_act", { ...actArgs, confirm: false });
+    const operationId = preview.structuredContent?.operationId;
+    expect(typeof operationId).toBe("string");
+    const created = await call(client, "write.sales.create_act", {
+      ...actArgs,
+      confirm: true,
+      operationId,
+    });
+    expect(created.isError, JSON.stringify(created)).toBe(true);
+    expect(JSON.stringify(created)).toContain("БанковскийСчетОрганизации_Key");
+    expect(JSON.stringify(created)).toContain("Ref_Key");
+    expect(created.structuredContent).toMatchObject({ verification: "failed" });
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("строковый LineNumber в readback не ломает сверку", async () => {
+    const { client, fake } = await setup({ stringLineNumber: true });
+    const preview = await call(client, "write.sales.create_act", { ...actArgs, confirm: false });
+    const operationId = preview.structuredContent?.operationId;
+    expect(typeof operationId).toBe("string");
+    const created = await call(client, "write.sales.create_act", {
+      ...actArgs,
+      confirm: true,
+      operationId,
+    });
+    expect(created.isError, JSON.stringify(created)).toBeFalsy();
+    expect(created.structuredContent).toMatchObject({ verification: "ok" });
+    expect(postCount(fake)).toBe(1);
   });
 
   it("непубликованный флаг УПД блокирует подтверждение", async () => {
