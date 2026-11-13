@@ -857,7 +857,14 @@ async function invoiceBasis(
   conn: Connection,
   entitySet: string,
   ref: string,
-): Promise<{ org: string; counterparty: string; contract?: string; total: number; vat: number }> {
+): Promise<{
+  org: string;
+  counterparty: string;
+  contract?: string;
+  currency?: string;
+  total: number;
+  vat: number;
+}> {
   const guid = ref.replace(/[{}']/g, "");
   const doc = await conn.client.getEntity(`${entitySet}(guid'${guid}')${buildQuery({})}`);
   // НДС собираем по ОБЕИМ табличным частям: акт услуг (create_act) живёт в
@@ -868,6 +875,7 @@ async function invoiceBasis(
     org: String(doc["Организация_Key"] ?? ""),
     counterparty: String(doc["Контрагент_Key"] ?? doc["Контрагент"] ?? ""),
     contract: (doc["ДоговорКонтрагента_Key"] as string) || undefined,
+    currency: (doc["ВалютаДокумента_Key"] as string) || undefined,
     total: Number(doc["СуммаДокумента"] ?? 0),
     vat,
   };
@@ -5629,6 +5637,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         numberRepresentation: z.string().trim().min(1).max(200).optional().describe("ПредставлениеНомера"),
         operationCode: z.string().optional().describe("Код вида операции (по умолчанию 01)"),
         vatDeductible: z.boolean().optional().describe("НДСПредъявленКВычету"),
+        currencyRef: z.string().uuid().optional().describe("Ref_Key валюты документа (если не наследовать)"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
@@ -5647,6 +5656,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       numberRepresentation,
       operationCode,
       vatDeductible,
+      currencyRef,
       confirm,
     }) =>
       guard("write.purchase.create_received_invoice", async () => {
@@ -5672,7 +5682,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           incomingTime !== undefined ||
           receiptCode !== undefined ||
           numberRepresentation !== undefined ||
-          vatDeductible !== undefined;
+          vatDeductible !== undefined ||
+          currencyRef !== undefined;
         if (historical) {
           if (!number) throw new InputError("Исторический счёт-фактура требует number.");
           if (!date) throw new InputError("Исторический счёт-фактура требует date.");
@@ -5700,17 +5711,63 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ["DeletionMark", "Edm.Boolean"],
           ] as const)
             need(field, type);
-          // Дубль по номеру/году/организации и по основанию.
-          const select = ["Ref_Key", "Number", "Date", "Организация_Key", "ДокументОснование"];
-          let found: ODataEntity[];
-          try {
-            found = (await fetchAll<ODataEntity>(conn.client, set, { select }, conn.behavior.pageSize, 5_000))
-              .rows;
-          } catch (error) {
-            if (!(error instanceof ODataError && error.status === 500)) throw error;
-            found = (await fetchAll<ODataEntity>(conn.client, set, { select }, conn.behavior.pageSize, 5_000))
-              .rows;
+          if (currencyRef !== undefined) {
+            need("ВалютаДокумента_Key", "Edm.Guid");
+            const currencies = resolveEntity(CATALOGS.currencies, await conn.available());
+            if (!currencies) throw new InputError("Справочник «Валюты» не опубликован.");
+            const cur = await conn.client.getEntity(
+              `${currencies}(${odataGuid(currencyRef)})?$format=json&$select=Ref_Key,DeletionMark`,
+            );
+            if (
+              String(cur["Ref_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== currencyRef.toLowerCase()
+            )
+              throw new InputError(`Валюта ${currencyRef} не найдена.`);
+            if (cur["DeletionMark"] === true) throw new InputError("Валюта помечена на удаление.");
           }
+          // Дубль по номеру/году/организации и по основанию. Флаг truncated не теряем,
+          // а при 500 повторяем уже ДРУГОЙ запрос — без серверного фильтра.
+          const select = [
+            "Ref_Key",
+            "Number",
+            "Date",
+            "Организация_Key",
+            "ДокументОснование",
+            "ДокументОснование_Type",
+          ];
+          const readDuplicates = async (filter?: string): Promise<ODataEntity[]> => {
+            const run = async (withFilter: boolean) => {
+              const read = await fetchAll<ODataEntity>(
+                conn.client,
+                set,
+                { ...(withFilter && filter ? { filter } : {}), select },
+                conn.behavior.pageSize,
+                5_000,
+              );
+              if (read.truncated)
+                throw new InputError(
+                  "Проверка дубля счёта-фактуры: достигнут предел строк, проход неполный.",
+                );
+              return read.rows;
+            };
+            try {
+              return await run(true);
+            } catch (error) {
+              if (!(error instanceof ODataError && error.status === 500)) throw error;
+              return run(false);
+            }
+          };
+          const byNumber = await readDuplicates(
+            and(
+              cmp("Number", "eq", odataString(number.trim())),
+              cmp("Организация_Key", "eq", odataGuid(b.org)),
+            ),
+          );
+          const byBasis = await readDuplicates(cmp("ДокументОснование", "eq", odataString(baseGuid)));
+          const found = [
+            ...new Map([...byNumber, ...byBasis].map((r) => [String(r["Ref_Key"]), r])).values(),
+          ];
           const year = String(
             odataDate(time ? new Date(`${date}T${time}`) : new Date(`${date}T00:00:00`)),
           ).slice(0, 4);
@@ -5754,6 +5811,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(incoming ? { ДатаВходящегоДокумента: incoming } : {}),
           ...(numberRepresentation ? { ПредставлениеНомера: numberRepresentation } : {}),
           ...(receiptCode !== undefined ? { КодСпособаПолучения: receiptCode } : {}),
+          ...((currencyRef ?? b.currency) ? { ВалютаДокумента_Key: currencyRef ?? b.currency } : {}),
           ДокументОснование: baseGuid,
           ДокументОснование_Type: `StandardODATA.${baseSet}`,
           НДСПредъявленКВычету: vatDeductible ?? true,
@@ -5802,6 +5860,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(incoming ? { ДатаВходящегоДокумента: incoming } : {}),
           ...(numberRepresentation ? { ПредставлениеНомера: numberRepresentation } : {}),
           ...(receiptCode !== undefined ? { КодСпособаПолучения: receiptCode } : {}),
+          ...((currencyRef ?? b.currency) ? { ВалютаДокумента_Key: currencyRef ?? b.currency } : {}),
           ДокументОснование: baseGuid,
           ДокументОснование_Type: `StandardODATA.${baseSet}`,
           НДСПредъявленКВычету: vatDeductible ?? true,
@@ -5823,7 +5882,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             String(row["ДокументОснование"] ?? "")
               .replace(/[{}]/g, "")
               .toLowerCase() !== baseGuid.toLowerCase() ||
-            String(row["ДокументОснование_Type"] ?? "") !== `StandardODATA.${baseSet}`
+            String(row["ДокументОснование_Type"] ?? "") !== `StandardODATA.${baseSet}` ||
+            Number(row["LineNumber"] ?? 0) !== 1
           )
             mismatch.push("ДокументыОснования[1]");
         }

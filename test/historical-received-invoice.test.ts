@@ -8,6 +8,7 @@ const CP = "22222222-2222-4222-8222-222222222222";
 const CTR = "33333333-3333-4333-8333-333333333333";
 const BASE = "44444444-4444-4444-8444-444444444444";
 const EXISTING = "55555555-5555-4555-8555-555555555555";
+const CUR = "66666666-6666-4666-8666-666666666666";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -15,7 +16,9 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((fn) => fn().catch(() => undefined)));
 });
 
-async function setup(options: { invoices?: Record<string, unknown>[] } = {}) {
+async function setup(
+  options: { invoices?: Record<string, unknown>[]; basisRow?: Record<string, unknown> } = {},
+) {
   const fake = fake1C(
     { READ_ONLY: "false", ODATA_WRITABLE: "true" },
     {
@@ -31,6 +34,7 @@ async function setup(options: { invoices?: Record<string, unknown>[] } = {}) {
         Организация_Key: ORG,
         Контрагент_Key: CP,
         ДоговорКонтрагента_Key: CTR,
+        ВалютаДокумента_Key: CUR,
         СуммаДокумента: 120,
         Товары: [{ СуммаНДС: 20 }],
         Услуги: [],
@@ -38,7 +42,14 @@ async function setup(options: { invoices?: Record<string, unknown>[] } = {}) {
     }
     if (path.startsWith("Document_СчетФактураПолученный(") && !path.includes("$select")) {
       const actual = await original(path);
-      return { DeletionMark: false, ...actual };
+      const rows = actual["ДокументыОснования"];
+      return {
+        DeletionMark: false,
+        ...actual,
+        ...(options.basisRow && Array.isArray(rows)
+          ? { ДокументыОснования: [{ ...(rows[0] as object), ...options.basisRow }] }
+          : {}),
+      };
     }
     return original(path);
   });
@@ -96,6 +107,7 @@ describe("write.purchase.create_received_invoice: исторический opt-i
       СуммаНДСДокумента: 20,
       ДокументОснование: BASE,
       ДокументОснование_Type: "StandardODATA.Document_ПоступлениеТоваровУслуг",
+      ВалютаДокумента_Key: CUR,
     });
     expect((payload["ДокументыОснования"] as Array<Record<string, unknown>>)[0]).toMatchObject({
       ДокументОснование: BASE,
@@ -122,6 +134,23 @@ describe("write.purchase.create_received_invoice: исторический opt-i
     expect(postCount(fake)).toBe(1);
   });
 
+  it("тип и номер строки основания проверяются вместе с ref", async () => {
+    const { client } = await setup({ basisRow: { LineNumber: 2 } });
+    const preview = await call(client, { ...args, confirm: false });
+    const operationId = preview.structuredContent?.operationId;
+    const created = await call(client, { ...args, confirm: true, operationId });
+    expect(created.isError).toBe(true);
+    expect(JSON.stringify(created)).toContain("ДокументыОснования");
+  });
+
+  it("явная валюта проверяется и участвует в GET", async () => {
+    const { client, fake } = await setup();
+    const preview = await call(client, { ...args, currencyRef: CUR, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    expect((preview.structuredContent?.payload as Record<string, unknown>)["ВалютаДокумента_Key"]).toBe(CUR);
+    expect(postCount(fake)).toBe(0);
+  });
+
   it("дубль по основанию или номеру отклоняется до POST", async () => {
     const { client, fake } = await setup({
       invoices: [
@@ -137,6 +166,22 @@ describe("write.purchase.create_received_invoice: исторический opt-i
     const preview = await call(client, { ...args, confirm: false });
     expect(preview.isError).toBe(true);
     expect(JSON.stringify(preview)).toContain("уже существует");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("переполнение проверки дубля — явная ошибка, а не частичный результат", async () => {
+    const { client, fake } = await setup({
+      invoices: Array.from({ length: 5001 }, (_, i) => ({
+        Ref_Key: `00000000-0000-0000-0000-${String(i).padStart(12, "0")}`,
+        Number: `N-${i}`,
+        Date: "2026-01-01T00:00:00",
+        Организация_Key: ORG,
+        ДокументОснование: `other-${i}`,
+      })),
+    });
+    const preview = await call(client, { ...args, confirm: false });
+    expect(preview.isError).toBe(true);
+    expect(JSON.stringify(preview)).toContain("предел строк");
     expect(postCount(fake)).toBe(0);
   });
 

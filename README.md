@@ -310,7 +310,7 @@ Claude: (вызывает read.catalog.list_warehouses: розничные ск�
 | `write.organization.create_bank_account` | Сопоставить или создать банковский счёт именно организации (владелец — организация, не контрагент); проверка владельца после записи — [подробнее](docs/BANK-LOADER.md) |
 | `write.money.create_bank_writeoff` | Списание с расчётного счёта (исходящий платёж, вид операции обязателен) |
 | `write.money.create_cash_receipt` / `write.money.create_cash_payment` | Приходный / расходный кассовый ордер (ПКО / РКО) |
-| `write.sales.create_issued_invoice` / `write.purchase.create_received_invoice` | Счёт-фактура выданный / полученный (на основании реализации / поступления); у полученного opt-in исторические Number/Date, входящие реквизиты, код получения/операции, флаг вычета, точное основание и readback |
+| `write.sales.create_issued_invoice` / `write.purchase.create_received_invoice` | Счёт-фактура выданный / полученный (на основании реализации / поступления); у полученного opt-in исторические Number/Date, входящие реквизиты, код получения/операции, флаг вычета, валюта (явная или из основания), точное основание/тип/строка и readback |
 | `write.entity.create_folder` / `write.entity.move_to_folder` | Папка (группа) справочника / перемещение в папку |
 | `write.counterparty.update_counterparty` / `write.catalog.update_nomenclature` / `write.entity.update_entity` | Изменение реквизитов (PATCH) |
 | `write.document.copy_document` | Документ по образцу существующего — со всеми реквизитами |
