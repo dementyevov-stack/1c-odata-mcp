@@ -13,6 +13,12 @@ import { CATALOGS, WRITE_DOCUMENTS, resolveEntity } from "../config/mapping.js";
 import { resolveOrgOrDefault, resolveOrganizationByRequisites } from "../odata/orgs.js";
 import { ensurePublished, requireEntity } from "../odata/publication.js";
 import {
+  buildHistoricalFields,
+  compareHistoricalFields,
+  type HistoricalField,
+  type HistoricalFieldType,
+} from "../odata/historical-fields.js";
+import {
   accountsByCode,
   accountsByRef,
   nomenclatureAccounts,
@@ -3107,6 +3113,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
   });
   const historicalPurchaseServiceLine = z.object({
     ...baseLineShape,
+    quantity: z.number().positive().optional().describe("Количество; при emptyQuantity не задаётся"),
+    emptyQuantity: z.boolean().optional().describe("Opt-in: количество в источнике пустое"),
     vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические"),
     amount: z.number().nonnegative().optional().describe("Явная сумма строки"),
     vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
@@ -3433,56 +3441,77 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...goodsLines.flatMap((l) => [l.inventoryAccountRef, l.vatAccountRef]),
         ].filter((r): r is string => Boolean(r));
         if (refs.length) await accountsByRef(conn, [...new Set(refs)]);
-        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, goodsLines, "purchase");
-        const rows = goodsLines.map((l, i) => {
-          const defaults = lineAccountsFor(l);
-          return clean({
-            ...(l.sourceLineId !== undefined ? { ИдентификаторСтроки: l.sourceLineId } : {}),
-            LineNumber: i + 1,
-            Номенклатура_Key: l.nomenclatureRef,
-            ...(l.content === undefined ? {} : { Содержание: l.content }),
-            Количество: l.quantity,
-            Цена: l.price,
-            Сумма: l.amount ?? lineSum(l),
-            СтавкаНДС: l.vatRate,
-            ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
-            СчетУчета_Key: l.inventoryAccountRef ?? defaults["СчетУчета_Key"],
-            СчетУчетаНДС_Key: l.vatAccountRef ?? defaults["СчетУчетаНДС_Key"],
-            ...(l.unitRef !== undefined ? { ЕдиницаИзмерения_Key: l.unitRef } : {}),
-            ...(l.coefficient !== undefined ? { Коэффициент: l.coefficient } : {}),
-            ...(l.countryOfOriginRef !== undefined ? { СтранаПроисхождения_Key: l.countryOfOriginRef } : {}),
-            // Пустой склад строки — явный нулевой GUID, чтобы сервер не подставил склад шапки.
-            ...(l.warehouseEmpty ? { Склад_Key: EMPTY_GUID } : {}),
-          });
+        const omitted = { kind: "omitted" } as const;
+        const empty = { kind: "empty" } as const;
+        const value = (v: unknown) => ({ kind: "value", value: v }) as const;
+        const field = (
+          name: string,
+          type: HistoricalFieldType,
+          intent: HistoricalField["intent"],
+          required = false,
+        ): HistoricalField => ({ name, type, intent, required });
+        const optional = (name: string, type: HistoricalFieldType, v: unknown): HistoricalField =>
+          v === undefined ? field(name, type, omitted) : field(name, type, value(v));
+
+        const goodsBuilt = goodsLines.map((l, i) => {
+          const fields: HistoricalField[] = [
+            field("LineNumber", "number", value(i + 1), true),
+            field("Номенклатура_Key", "guid", value(l.nomenclatureRef), true),
+            l.content === undefined
+              ? field("Содержание", "string", omitted)
+              : field("Содержание", "string", l.content === "" ? empty : value(l.content)),
+            field("Количество", "number", value(l.quantity), true),
+            field("Цена", "number", value(l.price), true),
+            field("Сумма", "number", value(l.amount ?? lineSum(l)), true),
+            field("СтавкаНДС", "string", value(l.vatRate), true),
+            optional("СуммаНДС", "number", l.vatAmount),
+            optional("ЕдиницаИзмерения_Key", "guid", l.unitRef),
+            optional("Коэффициент", "number", l.coefficient),
+            optional("СтранаПроисхождения_Key", "guid", l.countryOfOriginRef),
+            optional("СчетУчета_Key", "guid", l.inventoryAccountRef),
+            optional("СчетУчетаНДС_Key", "guid", l.vatAccountRef),
+            optional("ИдентификаторСтроки", "string", l.sourceLineId),
+            l.warehouseEmpty ? field("Склад_Key", "guid", empty) : field("Склад_Key", "guid", omitted),
+          ];
+          return buildHistoricalFields(fields);
         });
-        const serviceRows = (serviceLines ?? []).map((l, i) => {
-          const analytics = (
-            items: typeof l.analytics | undefined,
-            prefix: string,
-          ): Record<string, unknown> =>
-            Object.fromEntries(
-              (items ?? []).flatMap((item, index) => [
-                [`${prefix}${index + 1}`, item.ref],
-                [`${prefix}${index + 1}_Type`, item.type],
-              ]),
-            );
-          return clean({
-            ...(l.sourceLineId !== undefined ? { ИдентификаторСтроки: l.sourceLineId } : {}),
-            ...analytics(l.analytics, "Субконто"),
-            ...analytics(l.analyticsNu, "СубконтоНУ"),
-            LineNumber: i + 1,
-            Номенклатура_Key: l.nomenclatureRef,
-            ...(l.content === undefined ? {} : { Содержание: l.content }),
-            Количество: l.quantity,
-            Цена: l.price,
-            Сумма: l.amount ?? lineSum(l),
-            СтавкаНДС: l.vatRate,
-            ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
-            ...(l.costAccountRef !== undefined ? { СчетЗатрат_Key: l.costAccountRef } : {}),
-            ...(l.costAccountNuRef !== undefined ? { СчетЗатратНУ_Key: l.costAccountNuRef } : {}),
-            ...(l.vatAccountRef !== undefined ? { СчетУчетаНДС_Key: l.vatAccountRef } : {}),
+        const rows = goodsBuilt.map((b) => b.payload);
+
+        const serviceBuilt = (serviceLines ?? []).map((l, i) => {
+          const fields: HistoricalField[] = [
+            field("LineNumber", "number", value(i + 1), true),
+            field("Номенклатура_Key", "guid", value(l.nomenclatureRef), true),
+            l.content === undefined
+              ? field("Содержание", "string", omitted)
+              : field("Содержание", "string", l.content === "" ? empty : value(l.content)),
+            l.emptyQuantity
+              ? field("Количество", "number", empty)
+              : field("Количество", "number", value(l.quantity), true),
+            field("Цена", "number", value(l.price), true),
+            field(
+              "Сумма",
+              "number",
+              value(l.amount ?? (l.emptyQuantity ? undefined : lineSum(l as GoodsLine))),
+              true,
+            ),
+            field("СтавкаНДС", "string", value(l.vatRate), true),
+            optional("СуммаНДС", "number", l.vatAmount),
+            optional("СчетЗатрат_Key", "guid", l.costAccountRef),
+            optional("СчетЗатратНУ_Key", "guid", l.costAccountNuRef),
+            optional("СчетУчетаНДС_Key", "guid", l.vatAccountRef),
+            optional("ИдентификаторСтроки", "string", l.sourceLineId),
+          ];
+          (l.analytics ?? []).forEach((item, index) => {
+            fields.push(field(`Субконто${index + 1}`, "string", value(item.ref), true));
+            fields.push(field(`Субконто${index + 1}_Type`, "string", value(item.type), true));
           });
+          (l.analyticsNu ?? []).forEach((item, index) => {
+            fields.push(field(`СубконтоНУ${index + 1}`, "string", value(item.ref), true));
+            fields.push(field(`СубконтоНУ${index + 1}_Type`, "string", value(item.type), true));
+          });
+          return buildHistoricalFields(fields);
         });
+        const serviceRows = serviceBuilt.map((b) => b.payload);
         const allRows = [...rows, ...serviceRows];
         const netTotal =
           Math.round(allRows.reduce((sum, row) => sum + Number(row["Сумма"] ?? 0), 0) * 100) / 100;
@@ -3496,7 +3525,6 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const incoming = incomingDate
           ? odataDate(new Date(`${incomingDate}T${incomingTime ?? "00:00:00"}`))
           : undefined;
-        // Защита от дубля: номер + организация + год.
         {
           const select = ["Ref_Key", "Number", "Date", "Организация_Key"];
           let found: ODataEntity[];
@@ -3544,34 +3572,30 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               `Номер «${number}» уже занят документом ${String(conflict["Ref_Key"] ?? "")} за ${year} год.`,
             );
         }
-        const payload = clean({
-          Date: odataDate(documentDate),
-          Number: number.trim(),
-          ВидОперации: resolvedOperationKind,
-          Posted: false,
-          Организация_Key: org.key,
-          Склад_Key: warehouseKey,
-          Контрагент_Key: counterpartyRef,
-          ДоговорКонтрагента_Key: contractRef,
-          ...(comment !== undefined ? { Комментарий: comment } : {}),
-          ...(incomingNumber !== undefined ? { НомерВходящегоДокумента: incomingNumber } : {}),
-          ...(incoming !== undefined ? { ДатаВходящегоДокумента: incoming } : {}),
-          ...(settlementAccountRef
-            ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef }
-            : { СчетУчетаРасчетовСКонтрагентом_Key: settlement }),
-          ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
-          ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
-          СуммаВключаетНДС: sumIncludesVat,
-          СуммаДокумента: total,
+        const headerBuilt = buildHistoricalFields([
+          field("Date", "datetime", value(odataDate(documentDate)), true),
+          field("Number", "string", value(number.trim()), true),
+          field("ВидОперации", "string", value(resolvedOperationKind), true),
+          field("Posted", "boolean", value(false), true),
+          field("Организация_Key", "guid", value(org.key), true),
+          field("Склад_Key", "guid", value(warehouseKey), true),
+          field("Контрагент_Key", "guid", value(counterpartyRef), true),
+          field("ДоговорКонтрагента_Key", "guid", value(contractRef), true),
+          optional("Комментарий", "string", comment),
+          optional("НомерВходящегоДокумента", "string", incomingNumber),
+          optional("ДатаВходящегоДокумента", "datetime", incoming),
+          optional("СчетУчетаРасчетовСКонтрагентом_Key", "guid", settlementAccountRef),
+          optional("СчетУчетаРасчетовПоАвансам_Key", "guid", advanceAccountRef),
+          optional("ЭтоУниверсальныйДокумент", "boolean", universalDocument),
+          field("СуммаВключаетНДС", "boolean", value(sumIncludesVat), true),
+          field("СуммаДокумента", "number", value(total), true),
+        ]);
+        const payload = {
+          ...headerBuilt.payload,
           ...(goodsLines.length ? { Товары: rows } : {}),
           ...(serviceLines ? { Услуги: serviceRows } : {}),
-        });
-        let effectivePayload = payload;
-        const created = await createOrPreview(conn, set, payload, confirm, undefined, {
-          prepared: (prepared) => {
-            effectivePayload = prepared;
-          },
-        });
+        };
+        const created = await createOrPreview(conn, set, payload, confirm);
         if (!confirm || created.isError) return created;
         const createdData = created.structuredContent as Record<string, unknown> | undefined;
         const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
@@ -3593,93 +3617,47 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             structuredContent: { ...createdData, verification: "failed" },
           };
         }
-        const expectedHeader: Record<string, unknown> = {
-          Date: effectivePayload["Date"],
-          Number: effectivePayload["Number"],
-          ВидОперации: resolvedOperationKind,
-          Posted: false,
-          DeletionMark: false,
-          Организация_Key: org.key,
-          Склад_Key: warehouseKey,
-          Контрагент_Key: counterpartyRef,
-          ДоговорКонтрагента_Key: contractRef,
-          ...(comment !== undefined ? { Комментарий: effectivePayload["Комментарий"] } : {}),
-          ...(incomingNumber !== undefined ? { НомерВходящегоДокумента: incomingNumber } : {}),
-          ...(incoming !== undefined ? { ДатаВходящегоДокумента: incoming } : {}),
-          ...(settlementAccountRef ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef } : {}),
-          ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
-          ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
-          СуммаВключаетНДС: sumIncludesVat,
-          СуммаДокумента: total,
-        };
-        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
-        const types = new Map(
-          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        const headerMismatches = compareHistoricalFields(actual, [
+          ...headerBuilt.expectations,
+          { name: "DeletionMark", type: "boolean", expected: false, required: true, empty: false },
+        ]);
+        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = headerMismatches.map(
+          (m) => ({ field: m.field, expected: m.expected, actual: m.actual }),
         );
-        for (const [field, value] of Object.entries(expectedHeader))
-          if (!sameStoredValue(value, actual[field], types.get(field) ?? "Edm.String"))
-            mismatches.push({ field, expected: value, actual: actual[field] });
-        const actualRows = actual["Товары"];
-        if (goodsLines.length === 0) {
-          // Сервисный документ: таблицы «Товары» нет.
-        } else if (!Array.isArray(actualRows) || actualRows.length !== rows.length)
-          mismatches.push({
-            field: "Товары",
-            expected: `строк: ${rows.length}`,
-            actual: Array.isArray(actualRows) ? `строк: ${actualRows.length}` : "нет таблицы",
-          });
-        else {
-          const rowTypes = new Map(
-            (await conn.getMetadata()).entities
-              .get(`${set}_Товары`)
-              ?.properties.map((p) => [p.name, p.type]) ?? [],
-          );
-          rows.forEach((expected, index) => {
-            const actualRow = actualRows[index] as Record<string, unknown>;
-            for (const [field, value] of Object.entries(expected))
-              if (!sameStoredValue(value, actualRow[field], rowTypes.get(field) ?? "Edm.String"))
-                mismatches.push({
-                  field: `Товары[${index + 1}].${field}`,
-                  expected: value,
-                  actual: actualRow[field],
-                });
-            if (
-              actualRow["Склад_Key"] != null &&
-              String(actualRow["Склад_Key"]).replace(/[{}]/g, "") !== EMPTY_GUID
-            )
+        const compareTable = (name: "Товары" | "Услуги", built: typeof goodsBuilt) => {
+          // Несформированная таблица не является частью контракта: сервер может
+          // вернуть пустой/служебный набор. Если строки заданы — проверяем обе.
+          if (built.length === 0) return;
+          const actualRows = actual[name];
+          if (!Array.isArray(actualRows) || actualRows.length !== built.length) {
+            mismatches.push({
+              field: name,
+              expected: `строк: ${built.length}`,
+              actual: Array.isArray(actualRows) ? `строк: ${actualRows.length}` : "нет таблицы",
+            });
+            return;
+          }
+          built.forEach((row, index) => {
+            const rowMismatches = compareHistoricalFields(
+              actualRows[index] as Record<string, unknown>,
+              row.expectations,
+            );
+            for (const m of rowMismatches)
               mismatches.push({
-                field: `Товары[${index + 1}].Склад_Key`,
-                expected: null,
-                actual: actualRow["Склад_Key"],
+                field: `${name}[${index + 1}].${m.field}`,
+                expected: m.expected,
+                actual: m.actual,
               });
           });
-        }
-        if (serviceLines) {
-          const actualServices = actual["Услуги"];
-          if (!Array.isArray(actualServices) || actualServices.length !== serviceRows.length)
-            mismatches.push({
-              field: "Услуги",
-              expected: `строк: ${serviceRows.length}`,
-              actual: Array.isArray(actualServices) ? `строк: ${actualServices.length}` : "нет таблицы",
-            });
-          else {
-            const typesService = new Map(
-              (await conn.getMetadata()).entities
-                .get(`${set}_Услуги`)
-                ?.properties.map((p) => [p.name, p.type]) ?? [],
-            );
-            serviceRows.forEach((expected, index) => {
-              const actualRow = actualServices[index] as Record<string, unknown>;
-              for (const [field, value] of Object.entries(expected))
-                if (!sameStoredValue(value, actualRow[field], typesService.get(field) ?? "Edm.String"))
-                  mismatches.push({
-                    field: `Услуги[${index + 1}].${field}`,
-                    expected: value,
-                    actual: actualRow[field],
-                  });
-            });
-          }
-        }
+        };
+        compareTable("Товары", goodsBuilt);
+        compareTable("Услуги", serviceBuilt);
+        if (actual["БанковскийСчетОрганизации_Key"] != null && actual["БанковскийСчетОрганизации_Key"] !== "")
+          mismatches.push({
+            field: "БанковскийСчетОрганизации_Key",
+            expected: "пусто",
+            actual: actual["БанковскийСчетОрганизации_Key"],
+          });
         if (mismatches.length)
           return {
             ...created,
@@ -3696,9 +3674,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         return withStructured(created, {
           verification: "ok",
           verifiedFields: [
-            ...Object.keys(expectedHeader),
-            ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Товары[${i + 1}].${field}`)),
-            ...serviceRows.flatMap((row, i) => Object.keys(row).map((field) => `Услуги[${i + 1}].${field}`)),
+            ...headerBuilt.expectations.map((e) => e.name),
+            ...goodsBuilt.flatMap((row, i) => row.expectations.map((e) => `Товары[${i + 1}].${e.name}`)),
+            ...serviceBuilt.flatMap((row, i) => row.expectations.map((e) => `Услуги[${i + 1}].${e.name}`)),
           ],
         });
       }),
