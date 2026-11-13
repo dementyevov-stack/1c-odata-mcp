@@ -7,6 +7,7 @@ const ORG = "11111111-1111-4111-8111-111111111111";
 const ACC = "11111111-1111-4111-8111-111111111111";
 const NOM = "22222222-2222-4222-8222-222222222222";
 const RECIPIENT = "33333333-3333-4333-8333-333333333333";
+const CP = "55555555-5555-4555-8555-555555555555";
 const EXISTING = "44444444-4444-4444-8444-444444444444";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -25,6 +26,14 @@ async function setup(options: { docs?: Record<string, unknown>[]; readback?: Rec
   );
   const original = fake.conn.client.getEntity.bind(fake.conn.client);
   vi.spyOn(fake.conn.client, "getEntity").mockImplementation(async (path: string) => {
+    if (path.startsWith("Catalog_Контрагенты(")) return { Ref_Key: CP, DeletionMark: false, IsFolder: false };
+    if (path.startsWith("Catalog_БанковскиеСчета("))
+      return {
+        Ref_Key: RECIPIENT,
+        Owner: options.recipientOwner ?? CP,
+        Owner_Type: "StandardODATA.Catalog_Контрагенты",
+        DeletionMark: false,
+      };
     if (path.startsWith("Document_СписаниеСРасчетногоСчета(") && !path.includes("$select")) {
       if (options.readback) return { DeletionMark: false, ...options.readback };
       const actual = await original(path);
@@ -69,6 +78,7 @@ const args = {
   purposeText: "Комиссия банка",
   comment: "Историческая комиссия",
   recipientBankAccountRef: RECIPIENT,
+  counterpartyRef: CP,
   subconto: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
 };
 
@@ -84,6 +94,8 @@ describe("write.money.create_bank_writeoff: историческая Комис�
       ВидОперации: "КомиссияБанка",
       НомерВходящегоДокумента: "IN-BC-1",
       ДатаВходящегоДокумента: "2026-10-31T09:08:07",
+      Контрагент: CP,
+      Контрагент_Type: "StandardODATA.Catalog_Контрагенты",
       СчетБанк_Key: ACC,
       СчетУчетаРасчетовСКонтрагентом_Key: ACC,
       СтатьяДвиженияДенежныхСредств_Key: ACC,
@@ -104,6 +116,8 @@ describe("write.money.create_bank_writeoff: историческая Комис�
         ВидОперации: "КомиссияБанка",
         Организация_Key: ORG,
         СчетОрганизации_Key: ACC,
+        Контрагент: CP,
+        Контрагент_Type: "StandardODATA.Catalog_Контрагенты",
         СчетБанк_Key: ACC,
         СчетУчетаРасчетовСКонтрагентом_Key: ACC,
         СубконтоДт1: NOM,
@@ -137,6 +151,49 @@ describe("write.money.create_bank_writeoff: историческая Комис�
     expect(preview.isError).toBe(true);
     expect(JSON.stringify(preview)).toContain("уже занят");
     expect(postCount(fake)).toBe(0);
+  });
+
+  it("чужой банковский счёт получателя останавливает запись до POST", async () => {
+    const { client, fake } = await setup({ recipientOwner: ORG });
+    const preview = await call(client, { ...args, confirm: false });
+    expect(preview.isError).toBe(true);
+    expect(JSON.stringify(preview)).toContain("другому контрагенту");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("несовпадение типа/ссылки получателя в readback даёт failed", async () => {
+    const { client } = await setup({
+      readback: {
+        Number: "BC-1",
+        Date: "2026-11-01T10:20:30",
+        Posted: false,
+        ВидОперации: "КомиссияБанка",
+        Организация_Key: ORG,
+        СчетОрганизации_Key: ACC,
+        Контрагент: CP,
+        Контрагент_Type: "StandardODATA.Catalog_Покупатели",
+        СчетБанк_Key: ACC,
+        СчетУчетаРасчетовСКонтрагентом_Key: ACC,
+        СубконтоДт1: NOM,
+        СубконтоДт1_Type: "StandardODATA.Catalog_Номенклатура",
+        СчетКонтрагента_Key: RECIPIENT,
+        НомерВходящегоДокумента: "IN-BC-1",
+        ДатаВходящегоДокумента: "2026-10-31T09:08:07",
+        СуммаДокумента: 100,
+        НазначениеПлатежа: "Комиссия банка",
+        СтатьяДвиженияДенежныхСредств_Key: ACC,
+        Комментарий: "Историческая комиссия",
+        РасшифровкаПлатежа: [],
+      },
+    });
+    const preview = await call(client, { ...args, confirm: false });
+    const created = await call(client, {
+      ...args,
+      confirm: true,
+      operationId: preview.structuredContent?.operationId,
+    });
+    expect(created.isError).toBe(true);
+    expect(JSON.stringify(created)).toContain("Контрагент_Type");
   });
 
   it("обычный вызов сохраняет прежний путь", async () => {

@@ -3830,6 +3830,59 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           if (incomingNumber !== undefined) need("НомерВходящегоДокумента", "Edm.String");
           if (incomingDate !== undefined) need("ДатаВходящегоДокумента", "Edm.DateTime");
           if (recipientBankAccountRef !== undefined) need("СчетКонтрагента_Key", "Edm.Guid");
+          let counterpartyType: string | undefined;
+          if (counterpartyRef !== undefined) {
+            if (!GUID_RE.test(counterpartyRef))
+              throw new InputError("counterpartyRef должен быть Ref_Key (GUID).");
+            need("Контрагент", "Edm.String");
+            need("Контрагент_Type", "Edm.String");
+            const cpSet = resolveEntity(CATALOGS.counterparties, await conn.available());
+            if (!cpSet) throw new InputError("Справочник «Контрагенты» не опубликован.");
+            const cp = await conn.client.getEntity(
+              `${cpSet}(${odataGuid(counterpartyRef)})?$format=json&$select=Ref_Key,DeletionMark,IsFolder`,
+            );
+            if (
+              String(cp["Ref_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== counterpartyRef.toLowerCase()
+            )
+              throw new InputError(`Контрагент ${counterpartyRef} не найден.`);
+            if (cp["DeletionMark"] === true) throw new InputError("Контрагент помечен на удаление.");
+            if (cp["IsFolder"] === true) throw new InputError("Контрагент является группой.");
+            counterpartyType = `StandardODATA.${cpSet}`;
+          }
+          if (recipientBankAccountRef !== undefined) {
+            if (counterpartyRef === undefined)
+              throw new InputError(
+                "recipientBankAccountRef требует явный counterpartyRef для проверки владельца.",
+              );
+            const bankSet = resolveEntity(CATALOGS.bankAccounts, await conn.available());
+            if (!bankSet) throw new InputError("Справочник «Банковские счета» не опубликован.");
+            const recipient = await conn.client.getEntity(
+              `${bankSet}(${odataGuid(recipientBankAccountRef)})?$format=json&$select=Ref_Key,Owner,Owner_Type,DeletionMark`,
+            );
+            if (
+              String(recipient["Ref_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== recipientBankAccountRef.toLowerCase()
+            )
+              throw new InputError(`Банковский счёт получателя ${recipientBankAccountRef} не найден.`);
+            if (recipient["DeletionMark"] === true)
+              throw new InputError("Банковский счёт получателя помечен на удаление.");
+            if (
+              String(recipient["Owner"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== counterpartyRef.toLowerCase()
+            )
+              throw new InputError("Банковский счёт получателя принадлежит другому контрагенту.");
+            if (
+              String(recipient["Owner_Type"] ?? "") !== "" &&
+              String(recipient["Owner_Type"] ?? "") !== counterpartyType
+            )
+              throw new InputError(
+                `Тип владельца банковского счёта получателя ${String(recipient["Owner_Type"] ?? "")} не совпадает с ${counterpartyType}.`,
+              );
+          }
           const refs = [bankAccountingAccountRef, debitAccountRef].filter((r): r is string => Boolean(r));
           if (refs.length) await accountsByRef(conn, [...new Set(refs)]);
           if (subconto?.length) {
@@ -3867,6 +3920,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ВидОперации: operationKind,
             Организация_Key: org.key,
             СчетОрганизации_Key: bank,
+            ...(counterpartyRef && counterpartyType
+              ? { Контрагент: counterpartyRef, Контрагент_Type: counterpartyType }
+              : {}),
             СчетБанк_Key: bankAccountingAccountRef,
             СчетУчетаРасчетовСКонтрагентом_Key: debitAccountRef,
             ...subcontoFields,
@@ -3931,6 +3987,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ВидОперации: operationKind,
             Организация_Key: org.key,
             СчетОрганизации_Key: bank,
+            ...(counterpartyRef && counterpartyType
+              ? { Контрагент: counterpartyRef, Контрагент_Type: counterpartyType }
+              : {}),
             ...(bankAccountingAccountRef ? { СчетБанк_Key: bankAccountingAccountRef } : {}),
             ...(debitAccountRef ? { СчетУчетаРасчетовСКонтрагентом_Key: debitAccountRef } : {}),
             ...subcontoFields,
