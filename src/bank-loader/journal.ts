@@ -249,6 +249,39 @@ export function legacySourceHash(source: SourceDocument, target: TargetRequisite
   return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
 }
 
+/**
+ * Отпечаток журнала версии 482449f: number/time/ДДС/счёт покупателя уже есть, а четырёх
+ * новых opt-in полей (статья ДДС строки, счёт учёта банка, комментарий, ОтражениеВУСН) — нет.
+ * Принимается как эквивалент только когда эти четыре поля отсутствуют.
+ */
+export function intermediateSourceHash(source: SourceDocument, target: TargetRequisites): string {
+  const stable = {
+    sourceKey: source.sourceKey,
+    date: source.date,
+    number: source.number ?? "",
+    time: source.time ?? "",
+    amount: Math.round(source.amount * 100) / 100,
+    payerInn: source.payerInn,
+    payerKpp: source.payerKpp ?? "",
+    payerName: source.payerName ?? "",
+    payerAccountNumber: source.payerAccountNumber ?? "",
+    purpose: source.purpose ?? "",
+    documentNumber: source.documentNumber ?? "",
+    documentDate: source.documentDate ?? "",
+    vatRate: source.vatRate ?? "",
+    vatAmount: source.vatAmount ?? null,
+    cashFlowItemRef: source.cashFlowItemRef?.toLowerCase() ?? "",
+    customerInvoiceRef: source.customerInvoiceRef?.toLowerCase() ?? "",
+    contractNumber: source.contractNumber ?? "",
+    contractRef: source.contractRef?.toLowerCase() ?? "",
+    organizationInn: target.organizationInn,
+    organizationKpp: target.organizationKpp ?? "",
+    bankAccountNumber: target.bankAccountNumber,
+    bankBik: target.bankBik ?? "",
+  };
+  return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
+}
+
 export function hashSource(source: SourceDocument, target: TargetRequisites): string {
   const stable = {
     sourceKey: source.sourceKey,

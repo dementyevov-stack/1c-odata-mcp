@@ -3816,7 +3816,13 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .uuid()
           .optional()
           .describe("Ref_Key счёта учёта банка (СчетБанк_Key); проверяется существование в плане счетов"),
-        comment: z.string().trim().max(500).optional().describe("Явный комментарий шапки документа"),
+        comment: z
+          .string()
+          .trim()
+          .min(1)
+          .max(500)
+          .optional()
+          .describe("Явный непустой комментарий шапки документа"),
         incomeRecognition: z
           .string()
           .trim()

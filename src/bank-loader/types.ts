@@ -64,7 +64,7 @@ export const SourceDocumentSchema = z.object({
   customerInvoiceRef: z.string().uuid("customerInvoiceRef должен быть UUID").optional(),
   bankLedgerAccountRef: z.string().uuid("bankLedgerAccountRef должен быть UUID").optional(),
   /** Необязательный комментарий шапки; пишется только при явной передаче. */
-  comment: z.string().trim().max(500).optional(),
+  comment: z.string().trim().min(1).max(500).optional(),
   /** Признак отражения в доходах/расходах УСН (поле ОтражениеВУСН). */
   incomeRecognition: z.string().trim().min(1).max(50).optional(),
   contractNumber: z.string().trim().min(1).max(100).optional(),

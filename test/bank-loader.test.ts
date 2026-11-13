@@ -6,7 +6,7 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createServer } from "../src/mcp/server.js";
 import { fake1C, type FakeQuery } from "./helpers/fake-1c.js";
 import { ODataError } from "../src/odata/errors.js";
-import { BankLoadJournal, legacySourceHash } from "../src/bank-loader/journal.js";
+import { BankLoadJournal, intermediateSourceHash, legacySourceHash } from "../src/bank-loader/journal.js";
 import {
   ACCOUNT_FIND_TOOL,
   diagnose,
@@ -557,6 +557,52 @@ describe("подготовка оплаты покупателя", () => {
     const again = await runPackage(client, target, [changed], journal, { confirm: true });
     expect(again.documents[0]?.action).toBe("blocked");
     expect(postCount(fake)).toBe(1);
+  });
+
+  it("журнал 482449f с number/time/ДДС и без новых полей не конфликтует", async () => {
+    const { client, fake, journal } = await fixture();
+    const first = await prepareAndConfirm(client, target, source, journal);
+    expect(first.documents[0]?.action).toBe("created");
+    const entry = (await journal.get(source.sourceKey))!;
+    await journal.put({ ...entry, sourceHash: intermediateSourceHash(source, target) });
+    const again = await runPackage(client, target, [source], journal, { confirm: true });
+    expect(again.documents[0]?.action).toBe("already_loaded");
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("подготовленная строка журнала 482449f подтверждается после ручного обновления хеша", async () => {
+    const { client, fake, journal } = await fixture();
+    await runPackage(client, target, [source], journal, { confirm: false });
+    const entry = (await journal.get(source.sourceKey))!;
+    await journal.put({ ...entry, sourceHash: intermediateSourceHash(source, target) });
+    const confirmed = await runPackage(client, target, [source], journal, { confirm: true });
+    expect(confirmed.documents[0]?.action).toBe("created");
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it.each([
+    ["rowCashFlowItemRef", DDS],
+    ["bankLedgerAccountRef", ORG],
+    ["comment", "Добавленный комментарий"],
+    ["incomeRecognition", "Принимаются"],
+  ])("добавление нового поля %s к промежуточному журналу — конфликт", async (field, value) => {
+    const { client, fake, journal } = await fixture();
+    const first = await prepareAndConfirm(client, target, source, journal);
+    expect(first.documents[0]?.action).toBe("created");
+    const entry = (await journal.get(source.sourceKey))!;
+    await journal.put({ ...entry, sourceHash: intermediateSourceHash(source, target) });
+    const changed = { ...source, [field]: value } as SourceDocument;
+    const again = await runPackage(client, target, [changed], journal, { confirm: true });
+    expect(again.documents[0]?.action).toBe("blocked");
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("пустой комментарий отклоняется единообразно до записи", async () => {
+    const { client, fake, journal } = await fixture();
+    const run = await runPackage(client, target, [{ ...source, comment: "" }], journal, { confirm: false });
+    expect(run.documents[0]?.action).toBe("rejected");
+    expect(run.documents[0]?.note).toContain("comment");
+    expect(postCount(fake)).toBe(0);
   });
 
   it("второй пакет с тем же журналом получает отказ, а не теряет строки", async () => {

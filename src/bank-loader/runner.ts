@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { SourceDocument, TargetRequisites } from "./types.js";
 import {
   hashSource,
+  intermediateSourceHash,
   legacySourceHash,
   operationIdFor,
   type BankLoadEntry,
@@ -426,7 +427,7 @@ const argsFor = (
   ...(source.rowCashFlowItemRef ? { rowCashFlowItemRef: source.rowCashFlowItemRef } : {}),
   ...(source.customerInvoiceRef ? { customerInvoiceRef: source.customerInvoiceRef } : {}),
   ...(source.bankLedgerAccountRef ? { bankLedgerAccountRef: source.bankLedgerAccountRef } : {}),
-  ...(source.comment ? { comment: source.comment } : {}),
+  ...(source.comment !== undefined ? { comment: source.comment } : {}),
   ...(source.incomeRecognition ? { incomeRecognition: source.incomeRecognition } : {}),
   ...(source.contractNumber ? { contractNumber: source.contractNumber } : {}),
   ...(source.contractRef ? { contractRef: source.contractRef } : {}),
@@ -629,22 +630,22 @@ async function runOne(
   options: { confirm: boolean; mode: RunMode; database?: string },
 ): Promise<DocumentReport> {
   const sourceHash = hashSource(source, target);
-  const hasNewSourceFields = Boolean(
-    source.number ||
-    source.time ||
-    source.cashFlowItemRef ||
-    source.rowCashFlowItemRef ||
-    source.customerInvoiceRef ||
-    source.bankLedgerAccountRef ||
-    source.comment ||
-    source.incomeRecognition,
+  const hasNumberTimeDdsFields = Boolean(
+    source.number || source.time || source.cashFlowItemRef || source.customerInvoiceRef,
   );
-  // Старый отпечаток эквивалентен только пока в источнике нет полей, которых он не знает:
-  // иначе добавление номера/времени/ДДС/счёта покупателя должно стать конфликтом, а не already_loaded.
-  const legacyHash = hasNewSourceFields ? undefined : legacySourceHash(source, target);
+  const hasExplicitFields = Boolean(
+    source.rowCashFlowItemRef || source.bankLedgerAccountRef || source.comment || source.incomeRecognition,
+  );
+  // Старые отпечатки эквивалентны только для источников без полей, которых они не знают:
+  // 482449f — без четырёх новых opt-in полей; pre-482449f — ещё и без number/time/ДДС.
+  const intermediateHash = hasExplicitFields ? undefined : intermediateSourceHash(source, target);
+  const legacyHash =
+    hasExplicitFields || hasNumberTimeDdsFields ? undefined : legacySourceHash(source, target);
   const existing = await journal.get(source.sourceKey);
   const hashMatches =
-    existing?.sourceHash === sourceHash || (legacyHash !== undefined && existing?.sourceHash === legacyHash);
+    existing?.sourceHash === sourceHash ||
+    (intermediateHash !== undefined && existing?.sourceHash === intermediateHash) ||
+    (legacyHash !== undefined && existing?.sourceHash === legacyHash);
   const changed = existing !== undefined && !hashMatches;
   const mode = options.mode;
 
@@ -814,6 +815,7 @@ async function runOne(
   const reuse =
     preparedState?.state === "prepared" &&
     (preparedState.sourceHash === sourceHash ||
+      (intermediateHash !== undefined && preparedState.sourceHash === intermediateHash) ||
       (legacyHash !== undefined && preparedState.sourceHash === legacyHash)) &&
     preparedState.operationId !== undefined;
   const attempt = reuse && preparedState ? preparedState.attempt : (existing?.attempt ?? 0) + 1;
