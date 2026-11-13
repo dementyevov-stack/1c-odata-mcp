@@ -10100,6 +10100,17 @@
             "type": "string",
             "description": "Дата документа YYYY-MM-DD"
           },
+          "number": {
+            "description": "Номер самого документа (отдельно от documentNumber входящего поручения)",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "time": {
+            "description": "Точное время документа HH:MM:SS (по умолчанию 00:00:00)",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
           "purpose": {
             "description": "Назначение платежа",
             "type": "string",
@@ -10126,6 +10137,18 @@
             "description": "Явная сумма НДС из выписки; только вместе с vatRate",
             "type": "number",
             "minimum": 0
+          },
+          "cashFlowItemRef": {
+            "description": "Ref_Key статьи ДДС, если она задана явно; проверяется публикация и существование",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "customerInvoiceRef": {
+            "description": "Ref_Key счёта покупателю для строки расшифровки; проверяется публикация и существование",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
           },
           "contractNumber": {
             "description": "Точный номер договора",

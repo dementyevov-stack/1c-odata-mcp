@@ -149,6 +149,8 @@ export function hashSource(source: SourceDocument, target: TargetRequisites): st
   const stable = {
     sourceKey: source.sourceKey,
     date: source.date,
+    number: source.number ?? "",
+    time: source.time ?? "",
     amount: Math.round(source.amount * 100) / 100,
     payerInn: source.payerInn,
     payerKpp: source.payerKpp ?? "",
@@ -159,6 +161,8 @@ export function hashSource(source: SourceDocument, target: TargetRequisites): st
     documentDate: source.documentDate ?? "",
     vatRate: source.vatRate ?? "",
     vatAmount: source.vatAmount ?? null,
+    cashFlowItemRef: source.cashFlowItemRef?.toLowerCase() ?? "",
+    customerInvoiceRef: source.customerInvoiceRef?.toLowerCase() ?? "",
     contractNumber: source.contractNumber ?? "",
     contractRef: source.contractRef?.toLowerCase() ?? "",
     organizationInn: target.organizationInn,

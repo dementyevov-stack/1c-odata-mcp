@@ -23,6 +23,9 @@ const ACC = "44444444-4444-4444-8444-444444444444";
 const CP_ACC = "55555555-5555-4555-8555-555555555555";
 const BANK = "66666666-6666-4666-8666-666666666666";
 const CUR = "77777777-7777-4777-8777-777777777777";
+const DDS = "88888888-8888-4888-8888-888888888888";
+const INV = "99999999-9999-4999-8999-999999999999";
+const DOC = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ACCOUNT_NUMBER = "40702810000000000001";
 
 const target: TargetRequisites = {
@@ -35,6 +38,8 @@ const target: TargetRequisites = {
 const source: SourceDocument = {
   sourceKey: "statement-2026-11-01-0001",
   date: "2026-11-01",
+  number: "MY-1",
+  time: "14:35:20",
   amount: 1180,
   payerInn: "7800000000",
   payerKpp: "780000001",
@@ -45,6 +50,8 @@ const source: SourceDocument = {
   contractNumber: "D-1",
   vatRate: "НДС18",
   vatAmount: 180,
+  cashFlowItemRef: "88888888-8888-4888-8888-888888888888",
+  customerInvoiceRef: "99999999-9999-4999-8999-999999999999",
 };
 
 const orgRow = {
@@ -86,6 +93,10 @@ interface FixtureOptions {
   counterparties?: Record<string, unknown>[];
   contracts?: Record<string, unknown>[];
   bankAccounts?: Record<string, unknown>[];
+  documents?: Record<string, unknown>[];
+  cashFlowItems?: Record<string, unknown>[];
+  invoices?: Record<string, unknown>[];
+  banks?: Record<string, unknown>[];
   dropPostResponse?: boolean;
   respectSelect?: boolean;
 }
@@ -120,7 +131,17 @@ async function fixture(options: FixtureOptions = {}) {
       case "Catalog_Валюты":
         return [{ Ref_Key: CUR, Code: "643", Description: "Российский рубль" }];
       case "Catalog_Банки":
-        return [{ Ref_Key: BANK, Code: target.bankBik, Description: "Синтетический банк" }];
+        return (
+          options.banks ?? [
+            { Ref_Key: BANK, Code: target.bankBik, Description: "Синтетический банк", DeletionMark: false },
+          ]
+        );
+      case "Document_ПоступлениеНаРасчетныйСчет":
+        return options.documents ?? [];
+      case "Catalog_СтатьиДвиженияДенежныхСредств":
+        return options.cashFlowItems ?? [{ Ref_Key: DDS, Description: "Статья ДДС", DeletionMark: false }];
+      case "Document_СчетНаОплатуПокупателю":
+        return options.invoices ?? [{ Ref_Key: INV, Description: "Счёт покупателю", DeletionMark: false }];
       case "InformationRegister_СчетаУчетаРасчетовСКонтрагентами":
         return [];
       default:
@@ -179,11 +200,15 @@ const paymentArgs = (operationId?: string) => ({
   payerName: source.payerName,
   amount: source.amount,
   date: source.date,
+  number: source.number,
+  time: source.time,
   purpose: source.purpose,
   documentNumber: "BANK-77",
   documentDate: "2026-10-31",
   vatRate: "НДС18",
   vatAmount: 180,
+  cashFlowItemRef: DDS,
+  customerInvoiceRef: INV,
   contractNumber: "D-1",
   ...(operationId ? { operationId } : {}),
 });
@@ -264,9 +289,14 @@ describe("подготовка оплаты покупателя", () => {
     const row = (plan.payload?.["РасшифровкаПлатежа"] as Array<Record<string, unknown>>)[0]!;
     expect(row).toMatchObject({ СтавкаНДС: "НДС18", СуммаНДС: 180 });
     expect(plan.payload).toMatchObject({
+      Number: "MY-1",
+      Date: "2026-11-01T14:35:20",
       НомерВходящегоДокумента: "BANK-77",
       ДатаВходящегоДокумента: "2026-10-31T00:00:00",
+      СтатьяДвиженияДенежныхСредств_Key: DDS,
     });
+    const planRow = (plan.payload?.["РасшифровкаПлатежа"] as Array<Record<string, unknown>>)[0]!;
+    expect(planRow).toMatchObject({ СчетНаОплату_Key: INV });
     expect(postCount(fake)).toBe(0);
   });
 
@@ -447,6 +477,75 @@ describe("подготовка оплаты покупателя", () => {
     expect(postCount(fake)).toBe(1);
   });
 
+  it("конфликт номера документа за тот же год блокирует подтверждение", async () => {
+    const { client, fake, journal } = await fixture({
+      documents: [{ Ref_Key: DOC, Number: "MY-1", Date: "2026-05-01T00:00:00", Организация_Key: ORG }],
+    });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(run.documents[0]?.action).toBe("rejected");
+    expect(run.documents[0]?.note).toContain("уже занят");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("несуществующая статья ДДС блокирует запись до предпросмотра", async () => {
+    const { client, fake, journal } = await fixture();
+    const original = fake.conn.client.getEntity.bind(fake.conn.client);
+    vi.spyOn(fake.conn.client, "getEntity").mockImplementation(async (path: string) => {
+      if (path.startsWith("Catalog_СтатьиДвиженияДенежныхСредств("))
+        throw new ODataError({ kind: "not_found", message: "нет статьи" });
+      return original(path);
+    });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(run.documents[0]?.action).toBe("rejected");
+    expect(run.documents[0]?.note).toContain("Статья ДДС");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("несуществующий счёт покупателю блокирует запись", async () => {
+    const { client, fake, journal } = await fixture();
+    const original = fake.conn.client.getEntity.bind(fake.conn.client);
+    vi.spyOn(fake.conn.client, "getEntity").mockImplementation(async (path: string) => {
+      if (path.startsWith("Document_СчетНаОплатуПокупателю("))
+        throw new ODataError({ kind: "not_found", message: "нет счёта" });
+      return original(path);
+    });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(run.documents[0]?.action).toBe("rejected");
+    expect(run.documents[0]?.note).toContain("Счёт покупателю");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("отсутствующее в схеме поле счёта покупателю блокирует запись", async () => {
+    const { client, fake, journal } = await fixture();
+    const meta = await fake.conn.getMetadata();
+    const rowSet = "Document_ПоступлениеНаРасчетныйСчет_РасшифровкаПлатежа";
+    const row = meta.entities.get(rowSet)!;
+    const entities = new Map(meta.entities);
+    entities.set(rowSet, { ...row, properties: row.properties.filter((p) => p.name !== "СчетНаОплату_Key") });
+    vi.spyOn(fake.conn, "getMetadata").mockResolvedValue({ ...meta, entities });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(run.documents[0]?.action).toBe("rejected");
+    expect(run.documents[0]?.note).toContain("СчетНаОплату_Key");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("отсутствующая в схеме статья ДДС блокирует запись", async () => {
+    const { client, fake, journal } = await fixture();
+    const meta = await fake.conn.getMetadata();
+    const docSet = "Document_ПоступлениеНаРасчетныйСчет";
+    const doc = meta.entities.get(docSet)!;
+    const entities = new Map(meta.entities);
+    entities.set(docSet, {
+      ...doc,
+      properties: doc.properties.filter((p) => p.name !== "СтатьяДвиженияДенежныхСредств_Key"),
+    });
+    vi.spyOn(fake.conn, "getMetadata").mockResolvedValue({ ...meta, entities });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(run.documents[0]?.action).toBe("rejected");
+    expect(run.documents[0]?.note).toContain("СтатьяДвиженияДенежныхСредств_Key");
+    expect(postCount(fake)).toBe(0);
+  });
+
   it("явное поле, которого нет в схеме, останавливает запись с диагностикой", async () => {
     const { client, fake, journal } = await fixture();
     const meta = await fake.conn.getMetadata();
@@ -478,6 +577,43 @@ describe("банковский счёт организации", () => {
     expect(report.status).toBe("blocked");
     expect(report.blocker).toContain("bankBik");
     expect(report.minimalFix).toContain("target.bankBik");
+  });
+
+  it("при HTTP 500 на фильтрах банка и валюты переходит к ограниченному проходу", async () => {
+    const { client, fake } = await fixture({ bankAccounts: [] });
+    const original = fake.conn.client.getCollection.bind(fake.conn.client);
+    vi.spyOn(fake.conn.client, "getCollection").mockImplementation(async (path: string) => {
+      if (path.includes("$filter") && (path.startsWith("Catalog_Банки") || path.startsWith("Catalog_Валюты")))
+        throw new ODataError({ kind: "server", status: 500, message: "фильтр запрещён публикацией" });
+      return original(path);
+    });
+    const preview = await ensureAccount(client, target, { confirm: false });
+    expect(preview.status, JSON.stringify(preview)).toBe("preview");
+    expect(fake.requests.filter((r) => r.method === "POST")).toHaveLength(0);
+    const bankQueries = fake.requests.filter((r) => r.resource === "Catalog_Банки").map((r) => r.query ?? "");
+    const currencyQueries = fake.requests
+      .filter((r) => r.resource === "Catalog_Валюты")
+      .map((r) => r.query ?? "");
+    expect(bankQueries.some((q) => q !== "" && !q.includes("$filter"))).toBe(true);
+    expect(currencyQueries.some((q) => q !== "" && !q.includes("$filter"))).toBe(true);
+  });
+
+  it("находит банк по СВИФТБИК, если Code пуст", async () => {
+    const { client, fake } = await fixture({
+      bankAccounts: [],
+      banks: [
+        {
+          Ref_Key: BANK,
+          Code: "",
+          СВИФТБИК: "SABRRUMM",
+          Description: "Синтетический банк",
+          DeletionMark: false,
+        },
+      ],
+    });
+    const preview = await ensureAccount(client, { ...target, bankBik: "SABRRUMM" }, { confirm: false });
+    expect(preview.status, JSON.stringify(preview)).toBe("preview");
+    expect(fake.requests.filter((r) => r.method === "POST")).toHaveLength(0);
   });
 
   it("при настоящем $select запрашивает Owner_Type и всё равно находит счёт организации", async () => {

@@ -30,6 +30,7 @@ import {
 import {
   contactKindsForCounterparties,
   resolveBankByBik,
+  resolveCurrencyForAccount,
   resolveAdditionalProperty,
   type ContactKinds,
 } from "../odata/refdata.js";
@@ -3747,6 +3748,18 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .describe("Точный номер счёта плательщика из выписки (20 цифр), если он есть"),
         amount: z.number().positive().describe("Сумма оплаты"),
         date: z.string().describe("Дата документа YYYY-MM-DD"),
+        number: z
+          .string()
+          .trim()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Номер самого документа (отдельно от documentNumber входящего поручения)"),
+        time: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Точное время документа HH:MM:SS (по умолчанию 00:00:00)"),
         purpose: z.string().trim().max(500).optional().describe("Назначение платежа"),
         documentNumber: z
           .string()
@@ -3772,6 +3785,18 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .min(0)
           .optional()
           .describe("Явная сумма НДС из выписки; только вместе с vatRate"),
+        cashFlowItemRef: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("Ref_Key статьи ДДС, если она задана явно; проверяется публикация и существование"),
+        customerInvoiceRef: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            "Ref_Key счёта покупателю для строки расшифровки; проверяется публикация и существование",
+          ),
         contractNumber: z.string().trim().min(1).max(100).optional().describe("Точный номер договора"),
         contractRef: z.string().uuid().optional().describe("Ref_Key договора, если он известен"),
         confirm: confirmField,
@@ -3790,11 +3815,15 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       payerAccountNumber,
       amount,
       date,
+      number,
+      time,
       purpose,
       documentNumber,
       documentDate,
       vatRate,
       vatAmount,
+      cashFlowItemRef,
+      customerInvoiceRef,
       contractNumber,
       contractRef,
       confirm,
@@ -3842,6 +3871,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           need(headerProps, "ДатаВходящегоДокумента", "Edm.DateTime", "документа");
         if (payerAccountNumber !== undefined)
           need(headerProps, "СчетКонтрагента_Key", "Edm.Guid", "документа");
+        if (number !== undefined) need(headerProps, "Number", "Edm.String", "документа");
+        if (cashFlowItemRef !== undefined)
+          need(headerProps, "СтатьяДвиженияДенежныхСредств_Key", "Edm.Guid", "документа");
+        if (customerInvoiceRef !== undefined) need(rowProps, "СчетНаОплату_Key", "Edm.Guid", rowSet);
 
         // НДС: явные ставка и сумма — только вместе; сумму не вычисляем из суммы платежа.
         if ((vatRate === undefined) !== (vatAmount === undefined))
@@ -3862,11 +3895,65 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         if (vatRateValue === "БезНДС" && vatAmountValue !== 0)
           throw new InputError("Ставка «БезНДС» с ненулевой суммой НДС противоречива; проверьте источник.");
 
+        /** Явная ссылка должна быть опубликована и существовать; иначе отказ до записи. */
+        const existingTarget = async (
+          candidates: readonly string[],
+          ref: string,
+          label: string,
+        ): Promise<void> => {
+          const targetSet = resolveEntity(candidates, await conn.available());
+          if (!targetSet)
+            throw new InputError(`${label} не опубликован в OData — явную ссылку перенести нельзя.`);
+          try {
+            const target = await conn.client.getEntity(
+              `${targetSet}(${odataGuid(ref)})?$format=json&$select=Ref_Key,DeletionMark`,
+            );
+            if (String(target.Ref_Key).toLowerCase() !== ref.toLowerCase())
+              throw new InputError(`${label}: 1С вернула другой объект.`);
+            if (target.DeletionMark === true) throw new InputError(`${label} помечен на удаление.`);
+          } catch (error) {
+            if (error instanceof ODataError && error.kind === "not_found")
+              throw new InputError(`${label} с Ref_Key ${ref} не найден в базе.`);
+            throw error;
+          }
+        };
+
         // Точная резолюция — до записи: неоднозначность или неполный проход останавливают загрузку.
         const org = await resolveOrganizationByRequisites(conn, {
           inn: organizationInn,
           kpp: organizationKpp,
         });
+        const ownNumber = number?.trim();
+        if (ownNumber) {
+          const { rows, truncated } = await fetchAll(
+            conn.client,
+            set,
+            {
+              filter: and(
+                cmp("Number", "eq", odataString(ownNumber)),
+                cmp("Организация_Key", "eq", odataGuid(org.ref)),
+              ),
+              select: ["Ref_Key", "Number", "Date", "Организация_Key"],
+            },
+            conn.behavior.pageSize,
+            200,
+          );
+          if (truncated)
+            throw new InputError(
+              "Проверка номера документа: достигнут предел строк, проход неполный. " +
+                "Нельзя утверждать, что номер свободен; увеличьте ODATA_MAX_ROWS.",
+            );
+          const year = date.slice(0, 4);
+          const conflict = rows.find((r) => String(r["Date"] ?? "").slice(0, 4) === year);
+          if (conflict)
+            throw new InputError(
+              `Номер «${ownNumber}» уже занят документом ${String(conflict["Ref_Key"] ?? "")} ` +
+                `за ${year} год у этой организации. Выберите другой номер или не задавайте его — 1С пронумерует сама.`,
+            );
+        }
+        if (cashFlowItemRef) await existingTarget(CATALOGS.cashflowItems, cashFlowItemRef, "Статья ДДС");
+        if (customerInvoiceRef)
+          await existingTarget(WRITE_DOCUMENTS.customerInvoice, customerInvoiceRef, "Счёт покупателю");
         const bank = await resolveOrgBankAccountByNumber(conn, org.ref, orgBankAccountNumber);
         const counterparty = await resolveCounterpartyByRequisites(conn, {
           inn: payerInn,
@@ -3893,8 +3980,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const normalizedAmount = Math.round(amount * 100) / 100;
         if (normalizedAmount <= 0) throw new InputError("Сумма оплаты должна быть больше нуля.");
         const incomingDate = documentDate ? odataDate(new Date(`${documentDate}T00:00:00`)) : undefined;
+        const documentDateTime = odataDate(new Date(`${date}T${time ?? "00:00:00"}`));
         const payload = clean({
-          Date: odataDate(new Date(`${date}T00:00:00`)),
+          Date: documentDateTime,
+          ...(ownNumber ? { Number: ownNumber } : {}),
           Posted: false,
           ВидОперации: configuredOperationKind(conn.cfg, "customerPayment"),
           Организация_Key: org.ref,
@@ -3905,6 +3994,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(purpose !== undefined ? { НазначениеПлатежа: purpose } : {}),
           ...(documentNumber !== undefined ? { НомерВходящегоДокумента: documentNumber } : {}),
           ...(incomingDate ? { ДатаВходящегоДокумента: incomingDate } : {}),
+          ...(cashFlowItemRef ? { СтатьяДвиженияДенежныхСредств_Key: cashFlowItemRef } : {}),
           ...(payerBank ? { СчетКонтрагента_Key: payerBank.ref } : {}),
           СуммаДокумента: normalizedAmount,
           РасшифровкаПлатежа: [
@@ -3915,6 +4005,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               СуммаПлатежа: normalizedAmount,
               СтавкаНДС: vatRateValue,
               СуммаНДС: vatAmountValue,
+              ...(customerInvoiceRef ? { СчетНаОплату_Key: customerInvoiceRef } : {}),
               СчетУчетаРасчетовСКонтрагентом_Key: settle,
               СчетУчетаРасчетовПоАвансам_Key: advance,
             }),
@@ -3955,8 +4046,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         // Что именно проверяем контрольным чтением: только явно перенесённые/заполненные нами поля.
         // Счета расчётов MCP может уточнить по настройке договора — их сверяет отдельный путь.
         const expectedHeader: Record<string, unknown> = {
-          Date: payload["Date"],
+          Date: documentDateTime,
           Posted: false,
+          ...(ownNumber ? { Number: ownNumber } : {}),
           Организация_Key: org.ref,
           СчетОрганизации_Key: bank.ref,
           Контрагент: counterparty.ref,
@@ -3967,6 +4059,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(purpose !== undefined ? { НазначениеПлатежа: purpose } : {}),
           ...(documentNumber !== undefined ? { НомерВходящегоДокумента: documentNumber } : {}),
           ...(incomingDate ? { ДатаВходящегоДокумента: incomingDate } : {}),
+          ...(cashFlowItemRef ? { СтатьяДвиженияДенежныхСредств_Key: cashFlowItemRef } : {}),
           ...(payerBank ? { СчетКонтрагента_Key: payerBank.ref } : {}),
         };
         const effectiveRow =
@@ -3983,6 +4076,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(effectiveRow["СчетУчетаРасчетовПоАвансам_Key"] !== undefined
             ? { СчетУчетаРасчетовПоАвансам_Key: effectiveRow["СчетУчетаРасчетовПоАвансам_Key"] }
             : {}),
+          ...(customerInvoiceRef ? { СчетНаОплату_Key: customerInvoiceRef } : {}),
         };
         const verificationPlan = [
           ...Object.keys(expectedHeader),
@@ -4443,9 +4537,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const conn = ctx.db(database);
         const set = await requireEntity(conn, CATALOGS.bankAccounts, "Справочник «Банковские счета»");
         const bank = await resolveBankByBik(conn, bik);
-        const cur = currency
-          ? await resolveCatalogItem(conn, CATALOGS.currencies, "Справочник «Валюты»", currency)
-          : await resolveCatalogItem(conn, CATALOGS.currencies, "Справочник «Валюты»", "643");
+        const cur = await resolveCurrencyForAccount(conn, currency ?? "643");
         const payload = clean({
           Description: label ?? accountNumber,
           Owner: ownerRef,
@@ -4554,9 +4646,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             note: "Счёт организации с таким номером уже есть; запись не выполнялась.",
           });
         const bank = await resolveBankByBik(conn, bik);
-        const cur = currency
-          ? await resolveCatalogItem(conn, CATALOGS.currencies, "Справочник «Валюты»", currency)
-          : await resolveCatalogItem(conn, CATALOGS.currencies, "Справочник «Валюты»", "643");
+        const cur = await resolveCurrencyForAccount(conn, currency ?? "643");
         const payload = clean({
           Description: label ?? accountNumber,
           Owner: orgRef,

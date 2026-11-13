@@ -26,7 +26,7 @@ export const TargetRequisitesSchema = z.object({
   bankBik: z
     .string()
     .trim()
-    .regex(/^\d{9}$/, "БИК должен содержать 9 цифр")
+    .regex(/^[A-Z0-9]{8,11}$/i, "БИК: 9 цифр или СВИФТБИК из 8–11 латинских букв/цифр")
     .optional(),
 });
 export type TargetRequisites = z.infer<typeof TargetRequisitesSchema>;
@@ -35,6 +35,13 @@ export const SourceDocumentSchema = z.object({
   /** Стабильный ключ источника: по нему загрузчик связывает строку выписки с Ref_Key документа. */
   sourceKey: z.string().trim().min(1).max(200),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Дата документа — YYYY-MM-DD"),
+  /** Номер самого документа; отдельно от documentNumber входящего поручения. */
+  number: z.string().trim().min(1).max(100).optional(),
+  /** Точное время самого документа; отдельно от даты входящего поручения. */
+  time: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/, "Время документа — HH:MM:SS")
+    .optional(),
   amount: z.number().positive("Сумма должна быть больше нуля"),
   payerInn: inn,
   payerKpp: kpp.optional(),
@@ -51,6 +58,9 @@ export const SourceDocumentSchema = z.object({
   /** Явная историческая ставка и сумма НДС из выписки; обе или ни одной. */
   vatRate: z.string().trim().min(1).max(50).optional(),
   vatAmount: z.number().min(0).optional(),
+  /** Явные ссылки: статья ДДС (шапка) и счёт покупателя (строка расшифровки). */
+  cashFlowItemRef: z.string().uuid("cashFlowItemRef должен быть UUID").optional(),
+  customerInvoiceRef: z.string().uuid("customerInvoiceRef должен быть UUID").optional(),
   contractNumber: z.string().trim().min(1).max(100).optional(),
   contractRef: z.string().uuid("contractRef должен быть UUID").optional(),
 });
