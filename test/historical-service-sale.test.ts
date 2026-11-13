@@ -53,7 +53,7 @@ async function setup(options: Options = {}) {
     const entities = new Map(meta.entities);
     entities.set(set, {
       ...doc,
-      properties: doc.properties.filter((p) => p.name !== "ВидЭлектронногоДокумента"),
+      properties: doc.properties.filter((p) => p.name !== "ЭтоУниверсальныйДокумент"),
     });
     vi.spyOn(fake.conn, "getMetadata").mockResolvedValue({ ...meta, entities });
   }
@@ -122,13 +122,14 @@ describe("write.sales.create_act: исторический opt-in", () => {
       Number: "ACT-1",
       Date: "2026-11-01T16:20:30",
       Комментарий: "Исторический акт",
-      ВидЭлектронногоДокумента: "УПД",
+      ЭтоУниверсальныйДокумент: true,
       СуммаВключаетНДС: false,
       СуммаДокумента: 120,
       СчетУчетаРасчетовСКонтрагентом_Key: ACC,
       СчетУчетаРасчетовПоАвансам_Key: ACC,
     });
     expect(payload).not.toHaveProperty("БанковскийСчетОрганизации_Key");
+    expect(payload).not.toHaveProperty("ВидЭлектронногоДокумента");
     const row = (payload["Услуги"] as Array<Record<string, unknown>>)[0]!;
     expect(row).not.toHaveProperty("Количество");
     expect(row).toMatchObject({
@@ -177,11 +178,41 @@ describe("write.sales.create_act: исторический opt-in", () => {
     expect(postCount(fake)).toBe(0);
   });
 
+  it("независимый тип электронного документа не выводится из флага", async () => {
+    const { client, fake } = await setup();
+    const preview = await call(client, "write.sales.create_act", {
+      ...actArgs,
+      electronicDocumentType: "УПД",
+      confirm: false,
+    });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      ЭтоУниверсальныйДокумент: true,
+      ВидЭлектронногоДокумента: "УПД",
+    });
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("universalDocument=false сохраняется явно", async () => {
+    const { client, fake } = await setup();
+    const preview = await call(client, "write.sales.create_act", {
+      ...actArgs,
+      universalDocument: false,
+      confirm: false,
+    });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({ ЭтоУниверсальныйДокумент: false });
+    expect(payload).not.toHaveProperty("ВидЭлектронногоДокумента");
+    expect(postCount(fake)).toBe(0);
+  });
+
   it("непубликованный флаг УПД блокирует подтверждение", async () => {
     const { client, fake } = await setup({ missingUniversalField: true });
     const preview = await call(client, "write.sales.create_act", { ...actArgs, confirm: false });
     expect(preview.isError).toBe(true);
-    expect(JSON.stringify(preview)).toContain("ВидЭлектронногоДокумента");
+    expect(JSON.stringify(preview)).toContain("ЭтоУниверсальныйДокумент");
     expect(postCount(fake)).toBe(0);
   });
 

@@ -4014,7 +4014,17 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .boolean()
           .optional()
           .describe("true — явно пустой счёт организации; не выбирать default"),
-        universalDocument: z.boolean().optional().describe("true — УПД (ВидЭлектронногоДокумента)"),
+        universalDocument: z
+          .boolean()
+          .optional()
+          .describe("ЭтоУниверсальныйДокумент: true/false; не подменяет тип электронного документа"),
+        electronicDocumentType: z
+          .string()
+          .trim()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe("ВидЭлектронногоДокумента — независимый тип; не выводится из universalDocument"),
         operationKind: z
           .string()
           .trim()
@@ -4045,6 +4055,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       orgBankAccount,
       orgBankAccountEmpty,
       universalDocument,
+      electronicDocumentType,
       operationKind,
       sumIncludesVat,
       incomeAccount,
@@ -4072,6 +4083,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           advanceAccountRef !== undefined ||
           orgBankAccountEmpty === true ||
           universalDocument !== undefined ||
+          electronicDocumentType !== undefined ||
           lines.some(
             (line) =>
               line.emptyQuantity === true ||
@@ -4145,10 +4157,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           if (time !== undefined) need("Date", "Edm.DateTime");
           if (number !== undefined) need("Number", "Edm.String");
           if (comment !== undefined) need("Комментарий", "Edm.String");
-          if (universalDocument !== undefined) need("ВидЭлектронногоДокумента", "Edm.String");
-          if (universalDocument) {
-            // "УПД" — значение вида электронного документа в проверенной схеме БП.
-          }
+          if (universalDocument !== undefined) need("ЭтоУниверсальныйДокумент", "Edm.Boolean");
+          if (electronicDocumentType !== undefined) need("ВидЭлектронногоДокумента", "Edm.String");
           if (settlementAccountRef !== undefined) need("СчетУчетаРасчетовСКонтрагентом_Key", "Edm.Guid");
           if (advanceAccountRef !== undefined) need("СчетУчетаРасчетовПоАвансам_Key", "Edm.Guid");
           needRow("СчетДоходов_Key", "Edm.Guid");
@@ -4304,7 +4314,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             : { СчетУчетаРасчетовСКонтрагентом_Key: settlement }),
           ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
           ...(bank ? { БанковскийСчетОрганизации_Key: bank } : {}),
-          ...(universalDocument ? { ВидЭлектронногоДокумента: "УПД" } : {}),
+          ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
+          ...(electronicDocumentType !== undefined
+            ? { ВидЭлектронногоДокумента: electronicDocumentType }
+            : {}),
           СуммаВключаетНДС: sumIncludesVat,
           СуммаДокумента: documentTotal ?? calculatedTotal,
           Услуги: rows,
@@ -4325,7 +4338,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
                       "Количество не отправлено; представление пустого количества ждёт live-проверки.",
                   }
                 : {}),
-              ...(universalDocument ? { universalDocument: "УПД" } : {}),
+              ...(universalDocument !== undefined ? { universalDocument } : {}),
             });
           return created;
         }
@@ -4356,7 +4369,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(settlementAccountRef ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef } : {}),
           ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
           ...(orgBankAccountEmpty ? {} : bank ? { БанковскийСчетОрганизации_Key: bank } : {}),
-          ...(universalDocument ? { ВидЭлектронногоДокумента: "УПД" } : {}),
+          ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
+          ...(electronicDocumentType !== undefined
+            ? { ВидЭлектронногоДокумента: electronicDocumentType }
+            : {}),
           СуммаВключаетНДС: sumIncludesVat,
           СуммаДокумента: effectivePayload["СуммаДокумента"],
         };
@@ -4416,7 +4432,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         return withStructured(created, {
           verification: "ok",
           ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
-          ...(universalDocument ? { universalDocument: "УПД" } : {}),
+          ...(universalDocument !== undefined ? { universalDocument } : {}),
           verifiedFields: [
             ...Object.keys(expectedHeader),
             ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Услуги[${i + 1}].${field}`)),

@@ -9688,8 +9688,14 @@
             "type": "boolean"
           },
           "universalDocument": {
-            "description": "true — УПД (ВидЭлектронногоДокумента)",
+            "description": "ЭтоУниверсальныйДокумент: true/false; не подменяет тип электронного документа",
             "type": "boolean"
+          },
+          "electronicDocumentType": {
+            "description": "ВидЭлектронногоДокумента — независимый тип; не выводится из universalDocument",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
           },
           "operationKind": {
             "description": "ВидОперации; обычно не задавайте",
