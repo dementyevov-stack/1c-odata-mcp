@@ -180,26 +180,38 @@ export async function resolveCustomerContract(
     };
   }
 
-  const maxRows = Math.min(conn.behavior.maxRows, REQUISITES_SCAN_MAX);
-  const { rows, truncated } = await fetchAll(
-    conn.client,
-    set,
-    {
-      filter: and(
-        cmp("Owner_Key", "eq", odataGuid(cp)),
-        props.has("DeletionMark") ? cmp("DeletionMark", "eq", "false") : undefined,
-      ),
-      select,
-    },
-    conn.behavior.pageSize,
-    maxRows,
-  );
+  let rows: ODataEntity[];
+  let truncated: boolean;
+  try {
+    const read = await fetchAll<ODataEntity>(
+      conn.client,
+      set,
+      {
+        filter: and(
+          cmp("Owner_Key", "eq", odataGuid(cp)),
+          props.has("DeletionMark") ? cmp("DeletionMark", "eq", "false") : undefined,
+        ),
+        select,
+      },
+      conn.behavior.pageSize,
+      Math.min(conn.behavior.maxRows, REQUISITES_SCAN_MAX),
+    );
+    rows = read.rows;
+    truncated = read.truncated;
+  } catch (error) {
+    if (!isServer500(error)) throw error;
+    // Фильтр по Owner_Key может быть запрещён публикацией: ограниченный проход без фильтра,
+    // затем точная локальная сверка владельца, организации и удаления.
+    const read = await fetchAll<ODataEntity>(conn.client, set, { select }, conn.behavior.pageSize, 5_000);
+    rows = read.rows;
+    truncated = read.truncated;
+  }
   if (truncated)
     throw new InputError(
       `Договоры контрагента: прочитано ${rows.length} строк и достигнут предел — проход неполный. ` +
         "Укажите номер или Ref_Key договора, чтобы не выбирать по неполному списку.",
     );
-  const usable = rows.filter((r) => !accepted(r));
+  const usable = rows.filter((r) => guid(r["Owner_Key"]) === cp && !accepted(r));
   const number = p.contractNumber?.trim();
   if (number) {
     const hits = usable.filter((r) => str(r["Номер"]).trim() === number);

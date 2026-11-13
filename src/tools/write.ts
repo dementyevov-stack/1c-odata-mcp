@@ -3925,26 +3925,53 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         });
         const ownNumber = number?.trim();
         if (ownNumber) {
-          const { rows, truncated } = await fetchAll(
-            conn.client,
-            set,
-            {
-              filter: and(
-                cmp("Number", "eq", odataString(ownNumber)),
-                cmp("Организация_Key", "eq", odataGuid(org.ref)),
-              ),
-              select: ["Ref_Key", "Number", "Date", "Организация_Key"],
-            },
-            conn.behavior.pageSize,
-            200,
-          );
+          const select = ["Ref_Key", "Number", "Date", "Организация_Key"];
+          const sameNumber = (r: ODataEntity): boolean => {
+            const sameOrg =
+              String(r["Организация_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() === org.ref.toLowerCase();
+            return String(r["Number"] ?? "").trim() === ownNumber && sameOrg;
+          };
+          let rows: ODataEntity[];
+          let truncated: boolean;
+          try {
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              {
+                filter: and(
+                  cmp("Number", "eq", odataString(ownNumber)),
+                  cmp("Организация_Key", "eq", odataGuid(org.ref)),
+                ),
+                select,
+              },
+              conn.behavior.pageSize,
+              200,
+            );
+            rows = read.rows;
+            truncated = read.truncated;
+          } catch (error) {
+            if (!(error instanceof ODataError && error.status === 500)) throw error;
+            // Публикация может запрещать фильтр по Number/Организация_Key: ограниченный проход
+            // без фильтра, затем точная локальная сверка номера, года и владельца.
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              { select },
+              conn.behavior.pageSize,
+              5_000,
+            );
+            rows = read.rows;
+            truncated = read.truncated;
+          }
           if (truncated)
             throw new InputError(
               "Проверка номера документа: достигнут предел строк, проход неполный. " +
                 "Нельзя утверждать, что номер свободен; увеличьте ODATA_MAX_ROWS.",
             );
           const year = date.slice(0, 4);
-          const conflict = rows.find((r) => String(r["Date"] ?? "").slice(0, 4) === year);
+          const conflict = rows.find((r) => sameNumber(r) && String(r["Date"] ?? "").slice(0, 4) === year);
           if (conflict)
             throw new InputError(
               `Номер «${ownNumber}» уже занят документом ${String(conflict["Ref_Key"] ?? "")} ` +

@@ -145,6 +145,34 @@ export class BankLoadJournal {
 }
 
 /** Отпечаток источника и цели: хранится в журнале вместо самих реквизитов. */
+/**
+ * Отпечаток журнала предыдущей версии загрузчика (до number/time/ДДС/счёта покупателя).
+ * Нужен, чтобы уже созданные строки не выглядели «изменённым источником» после обновления.
+ */
+export function legacySourceHash(source: SourceDocument, target: TargetRequisites): string {
+  const stable = {
+    sourceKey: source.sourceKey,
+    date: source.date,
+    amount: Math.round(source.amount * 100) / 100,
+    payerInn: source.payerInn,
+    payerKpp: source.payerKpp ?? "",
+    payerName: source.payerName ?? "",
+    payerAccountNumber: source.payerAccountNumber ?? "",
+    purpose: source.purpose ?? "",
+    documentNumber: source.documentNumber ?? "",
+    documentDate: source.documentDate ?? "",
+    vatRate: source.vatRate ?? "",
+    vatAmount: source.vatAmount ?? null,
+    contractNumber: source.contractNumber ?? "",
+    contractRef: source.contractRef?.toLowerCase() ?? "",
+    organizationInn: target.organizationInn,
+    organizationKpp: target.organizationKpp ?? "",
+    bankAccountNumber: target.bankAccountNumber,
+    bankBik: target.bankBik ?? "",
+  };
+  return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
+}
+
 export function hashSource(source: SourceDocument, target: TargetRequisites): string {
   const stable = {
     sourceKey: source.sourceKey,

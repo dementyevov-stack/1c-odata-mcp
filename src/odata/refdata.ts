@@ -129,7 +129,7 @@ export async function resolveBankByBik(
       set,
       { select },
       conn.behavior.pageSize,
-      Math.min(conn.behavior.maxRows, BANKS_SCAN_MAX),
+      BANKS_SCAN_MAX,
     );
     rows = read.rows;
     truncated = read.truncated;
@@ -137,7 +137,7 @@ export async function resolveBankByBik(
   if (truncated)
     throw new InputError(
       "Справочник «Банки»: достигнут предел строк, проход неполный. Нельзя утверждать, " +
-        "что банк с таким БИК/СВИФТБИК один. Увеличьте ODATA_MAX_ROWS.",
+        "что банк с таким БИК/СВИФТБИК один. Увеличьте предел прохода или уточните реквизит.",
     );
   const exact = rows.filter((r) => matches(r, query));
   const usable = exact.filter(active);
@@ -183,7 +183,7 @@ export async function resolveCurrencyForAccount(
       set,
       { ...(filter ? { filter } : {}), select },
       conditionsPageSize(conn),
-      Math.min(conn.behavior.maxRows, 5_000),
+      5_000,
     );
   let rows: ODataEntityLike[];
   let truncated: boolean;

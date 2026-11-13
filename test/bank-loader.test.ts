@@ -6,7 +6,7 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createServer } from "../src/mcp/server.js";
 import { fake1C, type FakeQuery } from "./helpers/fake-1c.js";
 import { ODataError } from "../src/odata/errors.js";
-import { BankLoadJournal } from "../src/bank-loader/journal.js";
+import { BankLoadJournal, legacySourceHash } from "../src/bank-loader/journal.js";
 import {
   ACCOUNT_FIND_TOOL,
   diagnose,
@@ -97,6 +97,7 @@ interface FixtureOptions {
   cashFlowItems?: Record<string, unknown>[];
   invoices?: Record<string, unknown>[];
   banks?: Record<string, unknown>[];
+  env?: Record<string, string>;
   dropPostResponse?: boolean;
   respectSelect?: boolean;
 }
@@ -153,6 +154,7 @@ async function fixture(options: FixtureOptions = {}) {
       READ_ONLY: "false",
       ODATA_WRITABLE: "true",
       ODATA_WRITE_JOURNAL_DIR: writeDir,
+      ...(options.env ?? {}),
     },
     {
       data,
@@ -498,6 +500,76 @@ describe("подготовка оплаты покупателя", () => {
     expect(postCount(fake)).toBe(1);
   });
 
+  it("журнал предыдущей версии не считается изменённым источником", async () => {
+    const { client, fake, journal } = await fixture();
+    const first = await prepareAndConfirm(client, target, source, journal);
+    expect(first.documents[0]?.action).toBe("created");
+    const entry = (await journal.get(source.sourceKey))!;
+    await journal.put({ ...entry, sourceHash: legacySourceHash(source, target) });
+    const again = await runPackage(client, target, [source], journal, { confirm: true });
+    expect(again.documents[0]?.action).toBe("already_loaded");
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("журнал предыдущей версии с неизвестным POST всё равно сверяется", async () => {
+    const { client, fake, journal } = await fixture({ dropPostResponse: true });
+    const first = await prepareAndConfirm(client, target, source, journal);
+    expect(first.documents[0]?.action).toBe("unknown");
+    const entry = (await journal.get(source.sourceKey))!;
+    await journal.put({ ...entry, sourceHash: legacySourceHash(source, target) });
+    const resumed = await runPackage(client, target, [source], journal, {
+      confirm: true,
+      mode: "resume",
+    });
+    expect(resumed.documents[0]?.action).toBe("reconciled");
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("Number-фильтр 500: ограниченный проход находит конфликт номера", async () => {
+    const { client, fake, journal } = await fixture({
+      documents: [{ Ref_Key: DOC, Number: "MY-1", Date: "2026-05-01T00:00:00", Организация_Key: ORG }],
+    });
+    const original = fake.conn.client.getCollection.bind(fake.conn.client);
+    vi.spyOn(fake.conn.client, "getCollection").mockImplementation(async (path: string) => {
+      if (path.startsWith("Document_ПоступлениеНаРасчетныйСчет?") && path.includes("$filter"))
+        throw new ODataError({ kind: "server", status: 500, message: "фильтр Number запрещён" });
+      return original(path);
+    });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(run.documents[0]?.action).toBe("rejected");
+    expect(run.documents[0]?.note).toContain("уже занят");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("Number-фильтр 500 без конфликта: план готовится по ограниченному проходу", async () => {
+    const { client, fake, journal } = await fixture();
+    const original = fake.conn.client.getCollection.bind(fake.conn.client);
+    vi.spyOn(fake.conn.client, "getCollection").mockImplementation(async (path: string) => {
+      if (path.startsWith("Document_ПоступлениеНаРасчетныйСчет?") && path.includes("$filter"))
+        throw new ODataError({ kind: "server", status: 500, message: "фильтр Number запрещён" });
+      return original(path);
+    });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(run.documents[0]?.action).toBe("dry_run");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("фильтры контрагента и договора 500: работают ограниченные запасные проходы", async () => {
+    const { client, fake, journal } = await fixture();
+    const original = fake.conn.client.getCollection.bind(fake.conn.client);
+    vi.spyOn(fake.conn.client, "getCollection").mockImplementation(async (path: string) => {
+      if (
+        (path.startsWith("Catalog_Контрагенты") || path.startsWith("Catalog_ДоговорыКонтрагентов")) &&
+        path.includes("$filter")
+      )
+        throw new ODataError({ kind: "server", status: 500, message: "фильтр запрещён" });
+      return original(path);
+    });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(run.documents[0]?.action, JSON.stringify(run.documents[0])).toBe("dry_run");
+    expect(postCount(fake)).toBe(0);
+  });
+
   it("конфликт номера документа за тот же год блокирует подтверждение", async () => {
     const { client, fake, journal } = await fixture({
       documents: [{ Ref_Key: DOC, Number: "MY-1", Date: "2026-05-01T00:00:00", Организация_Key: ORG }],
@@ -617,6 +689,19 @@ describe("банковский счёт организации", () => {
       .map((r) => r.query ?? "");
     expect(bankQueries.some((q) => q !== "" && !q.includes("$filter"))).toBe(true);
     expect(currencyQueries.some((q) => q !== "" && !q.includes("$filter"))).toBe(true);
+  });
+
+  it("несколько банков с одним БИК блокируют создание счёта", async () => {
+    const { client } = await fixture({
+      bankAccounts: [],
+      banks: [
+        { Ref_Key: BANK, Code: target.bankBik, Description: "Банк 1", DeletionMark: false },
+        { Ref_Key: DDS, Code: target.bankBik, Description: "Банк 2", DeletionMark: false },
+      ],
+    });
+    const preview = await ensureAccount(client, target, { confirm: false });
+    expect(preview.status).toBe("refused");
+    expect(preview.note).toContain("несколько банков");
   });
 
   it("находит банк по СВИФТБИК, если Code пуст", async () => {

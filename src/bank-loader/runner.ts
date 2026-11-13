@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import type { SourceDocument, TargetRequisites } from "./types.js";
-import { hashSource, operationIdFor, type BankLoadEntry, BankLoadJournal } from "./journal.js";
+import {
+  hashSource,
+  legacySourceHash,
+  operationIdFor,
+  type BankLoadEntry,
+  BankLoadJournal,
+} from "./journal.js";
 
 /**
  * Загрузчик первого участка: говорит с MCP-сервером по stdio (в тестах — по in-memory
@@ -620,8 +626,10 @@ async function runOne(
   options: { confirm: boolean; mode: RunMode; database?: string },
 ): Promise<DocumentReport> {
   const sourceHash = hashSource(source, target);
+  const legacyHash = legacySourceHash(source, target);
   const existing = await journal.get(source.sourceKey);
-  const changed = existing !== undefined && existing.sourceHash !== sourceHash;
+  const hashMatches = existing?.sourceHash === sourceHash || existing?.sourceHash === legacyHash;
+  const changed = existing !== undefined && !hashMatches;
   const mode = options.mode;
 
   if (mode === "resume" && !existing)
@@ -789,7 +797,7 @@ async function runOne(
 
   const reuse =
     preparedState?.state === "prepared" &&
-    preparedState.sourceHash === sourceHash &&
+    (preparedState.sourceHash === sourceHash || preparedState.sourceHash === legacyHash) &&
     preparedState.operationId !== undefined;
   const attempt = reuse && preparedState ? preparedState.attempt : (existing?.attempt ?? 0) + 1;
   const operationId =
