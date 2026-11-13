@@ -5,12 +5,12 @@ import {
   guardedDocumentAction,
 } from "../odata/existing-bank-settlement.js";
 import { operationKind as configuredOperationKind, type AccountDefault } from "../config/accounting.js";
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { CallToolResult, McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { Connection, ServerContext } from "../context.js";
-import { ok, fail, guard, databaseField, organizationField } from "./_shared.js";
+import { ok, fail, guard, databaseField, organizationField, renderJson } from "./_shared.js";
 import { CATALOGS, WRITE_DOCUMENTS, resolveEntity } from "../config/mapping.js";
-import { resolveOrgOrDefault } from "../odata/orgs.js";
+import { resolveOrgOrDefault, resolveOrganizationByRequisites } from "../odata/orgs.js";
 import { ensurePublished, requireEntity } from "../odata/publication.js";
 import {
   accountsByCode,
@@ -20,6 +20,13 @@ import {
   type NomAccounts,
 } from "../odata/accounting.js";
 import { settlementAccountsFor, type SettlementSide } from "../odata/settlement-accounts.js";
+import {
+  findBankAccountsByOwnerAndNumber,
+  resolveCounterpartyBankAccountByNumber,
+  resolveCounterpartyByRequisites,
+  resolveCustomerContract,
+  resolveOrgBankAccountByNumber,
+} from "../odata/bank-receipt.js";
 import {
   contactKindsForCounterparties,
   resolveBankByBik,
@@ -108,6 +115,28 @@ const CONTRACT_KINDS = ["СПокупателем", "СПоставщиком", 
 
 /** Ставки НДС (Enum_СтавкиНДС), подмножество ходовых. */
 const VAT_RATES = ["БезНДС", "НДС0", "НДС5", "НДС7", "НДС10", "НДС20", "НДС22"] as const;
+
+/**
+ * Ставки НДС для переноса явных исторических значений из банковской выписки. Список — из
+ * Enum_СтавкиНДС БП 3.0, включая ставки до 2019 года и расчётные; неизвестное значение
+ * отклоняется до записи, а не отправляется в 1С наугад.
+ */
+const BANK_VAT_RATES = [
+  "БезНДС",
+  "НДС0",
+  "НДС5",
+  "НДС5_105",
+  "НДС7",
+  "НДС7_107",
+  "НДС10",
+  "НДС10_110",
+  "НДС18",
+  "НДС18_118",
+  "НДС20",
+  "НДС20_120",
+  "НДС22",
+  "НДС22_122",
+] as const;
 
 /**
  * Дата → формат 1С Edm.DateTime ('YYYY-MM-DDTHH:mm:ss', без зоны).
@@ -1467,7 +1496,7 @@ async function createOrPreview(
   notes?: string[],
   /** keepSettlement — счета расчётов уже заданы (копия документа): настройку договора не применять. */
   opts?: { keepSettlement?: boolean; settlementSide?: SettlementSide },
-) {
+): Promise<CallToolResult> {
   const contract = await withDefaultContract(conn, entitySet, payload);
   const settlement = opts?.keepSettlement
     ? { payload: contract.payload, notes: [] }
@@ -1514,6 +1543,25 @@ async function createOrPreview(
     description: created["Description"],
     ...createdExtra,
   });
+}
+
+/** Первая строка «Расшифровки платежа» из прочитанного документа. */
+function rowValue(doc: ODataEntity, field: string): unknown {
+  const rows = doc["РасшифровкаПлатежа"];
+  const row = Array.isArray(rows) ? (rows[0] as Record<string, unknown> | undefined) : undefined;
+  return row?.[field];
+}
+
+/** Дополняет successful-результат инструмента, не теряя operationId и текстовый блок. */
+function withStructured(result: CallToolResult, extra: Record<string, unknown>): CallToolResult {
+  const structuredContent = { ...(result.structuredContent ?? {}), ...extra };
+  return {
+    ...result,
+    content: result.content.map((item) =>
+      item.type === "text" ? { ...item, text: renderJson(structuredContent) } : item,
+    ),
+    structuredContent,
+  };
 }
 
 /** Скалярные поля шапки из fields, опубликованные у объекта, с их типами из $metadata. */
@@ -3656,6 +3704,356 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       }),
   );
 
+  server.registerTool(
+    "write.money.create_payment_from_statement",
+    {
+      title: "Создать оплату покупателя из строки выписки",
+      description:
+        "Первый участок загрузчика банковских документов БП. Создаёт «Поступление на расчётный счёт» " +
+        "по строке выписки: находит организацию по точным ИНН/КПП, её банковский счёт по номеру, " +
+        "контрагента-покупателя по точным ИНН/КПП и договор по номеру (или единственный подходящий). " +
+        "Явные поля источника переносятся по схеме: ставка и сумма НДС (включая исторические), " +
+        "назначение платежа, номер/дата входящего документа и счёт плательщика. Если поле не " +
+        "опубликовано или контрольное чтение после создания не совпало — отказ с диагностикой, " +
+        "а не молчаливая потеря данных. Dry-run по умолчанию; для записи передайте operationId " +
+        "из предпросмотра и confirm=true. Стабильный sourceKey делает повторный запуск безопасным.",
+      inputSchema: z.object({
+        database: databaseField,
+        sourceKey: z
+          .string()
+          .trim()
+          .min(1)
+          .max(200)
+          .describe("Стабильный ключ строки источника (например, идентификатор платежа в выписке)"),
+        organizationInn: z.string().trim().describe("Точный ИНН организации-получателя"),
+        organizationKpp: z.string().trim().optional().describe("Точный КПП организации-получателя"),
+        orgBankAccountNumber: z
+          .string()
+          .trim()
+          .describe("Точный номер банковского счёта организации-получателя (20 цифр)"),
+        payerInn: z.string().trim().describe("Точный ИНН плательщика (покупателя)"),
+        payerKpp: z.string().trim().optional().describe("Точный КПП плательщика"),
+        payerName: z.string().trim().max(300).optional().describe("Наименование плательщика в источнике"),
+        payerAccountNumber: z
+          .string()
+          .trim()
+          .optional()
+          .describe("Точный номер счёта плательщика из выписки (20 цифр), если он есть"),
+        amount: z.number().positive().describe("Сумма оплаты"),
+        date: z.string().describe("Дата документа YYYY-MM-DD"),
+        purpose: z.string().trim().max(500).optional().describe("Назначение платежа"),
+        documentNumber: z
+          .string()
+          .trim()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Номер входящего банковского документа"),
+        documentDate: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .optional()
+          .describe("Дата входящего банковского документа YYYY-MM-DD"),
+        vatRate: z
+          .string()
+          .trim()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("Явная ставка НДС из выписки (НДС18, НДС20, БезНДС…); только вместе с vatAmount"),
+        vatAmount: z
+          .number()
+          .min(0)
+          .optional()
+          .describe("Явная сумма НДС из выписки; только вместе с vatRate"),
+        contractNumber: z.string().trim().min(1).max(100).optional().describe("Точный номер договора"),
+        contractRef: z.string().uuid().optional().describe("Ref_Key договора, если он известен"),
+        confirm: confirmField,
+      }),
+      outputSchema: createResultSchema,
+    },
+    ({
+      database,
+      sourceKey,
+      organizationInn,
+      organizationKpp,
+      orgBankAccountNumber,
+      payerInn,
+      payerKpp,
+      payerName,
+      payerAccountNumber,
+      amount,
+      date,
+      purpose,
+      documentNumber,
+      documentDate,
+      vatRate,
+      vatAmount,
+      contractNumber,
+      contractRef,
+      confirm,
+    }) =>
+      guard("write.money.create_payment_from_statement", async () => {
+        const conn = ctx.db(database);
+        const set = await requireEntity(
+          conn,
+          WRITE_DOCUMENTS.bankIn,
+          "Документ «Поступление на расчётный счёт»",
+        );
+        const meta = await conn.getMetadata();
+        const docMeta = meta.entities.get(set);
+        if (!docMeta) throw new InputError(`Объект ${set} отсутствует в схеме базы.`);
+        const rowSet = `${set}_РасшифровкаПлатежа`;
+        const rowMeta = meta.entities.get(rowSet);
+        const headerProps = new Map(docMeta.properties.map((p) => [p.name, p.type]));
+        const rowProps = new Map((rowMeta?.properties ?? []).map((p) => [p.name, p.type]));
+        const need = (props: Map<string, string>, field: string, type: string, where: string): void => {
+          const actual = props.get(field);
+          if (actual !== type)
+            throw new InputError(
+              `Схема ${where} не публикует поле ${field} с типом ${type}` +
+                (actual ? ` (найдено ${actual})` : "") +
+                ". Явное значение из выписки перенести нельзя — запись не начата.",
+            );
+        };
+        // Поля, которые загрузчик заполняет всегда: без них договор/сумма/НДС потеряются молча.
+        need(headerProps, "Организация_Key", "Edm.Guid", "документа");
+        need(headerProps, "СчетОрганизации_Key", "Edm.Guid", "документа");
+        need(headerProps, "Контрагент", "Edm.String", "документа");
+        need(headerProps, "Контрагент_Type", "Edm.String", "документа");
+        need(headerProps, "ДоговорКонтрагента_Key", "Edm.Guid", "документа");
+        need(headerProps, "ВидОперации", "Edm.String", "документа");
+        need(headerProps, "СуммаДокумента", "Edm.Double", "документа");
+        need(rowProps, "ДоговорКонтрагента_Key", "Edm.Guid", rowSet);
+        need(rowProps, "СпособПогашенияЗадолженности", "Edm.String", rowSet);
+        need(rowProps, "СуммаПлатежа", "Edm.Double", rowSet);
+        need(rowProps, "СтавкаНДС", "Edm.String", rowSet);
+        need(rowProps, "СуммаНДС", "Edm.Double", rowSet);
+        if (purpose !== undefined) need(headerProps, "НазначениеПлатежа", "Edm.String", "документа");
+        if (documentNumber !== undefined)
+          need(headerProps, "НомерВходящегоДокумента", "Edm.String", "документа");
+        if (documentDate !== undefined)
+          need(headerProps, "ДатаВходящегоДокумента", "Edm.DateTime", "документа");
+        if (payerAccountNumber !== undefined)
+          need(headerProps, "СчетКонтрагента_Key", "Edm.Guid", "документа");
+
+        // НДС: явные ставка и сумма — только вместе; сумму не вычисляем из суммы платежа.
+        if ((vatRate === undefined) !== (vatAmount === undefined))
+          throw new InputError(
+            "НДС: укажите и ставку (vatRate), и сумму (vatAmount) из источника — одну величину не угадываем.",
+          );
+        const explicitVat = vatRate !== undefined;
+        const vatRateValue = vatRate ?? "БезНДС";
+        const vatAmountValue = Math.round((vatAmount ?? 0) * 100) / 100;
+        if (!(BANK_VAT_RATES as readonly string[]).includes(vatRateValue))
+          throw new InputError(
+            `Ставка НДС «${vatRateValue}» не входит в Enum_СтавкиНДС БП 3.0. Допустимые: ${BANK_VAT_RATES.join(", ")}.`,
+          );
+        if (vatAmountValue > amount + 0.005)
+          throw new InputError(
+            `Сумма НДС ${vatAmountValue} больше суммы платежа ${amount}: явные данные выписки противоречивы.`,
+          );
+        if (vatRateValue === "БезНДС" && vatAmountValue !== 0)
+          throw new InputError("Ставка «БезНДС» с ненулевой суммой НДС противоречива; проверьте источник.");
+
+        // Точная резолюция — до записи: неоднозначность или неполный проход останавливают загрузку.
+        const org = await resolveOrganizationByRequisites(conn, {
+          inn: organizationInn,
+          kpp: organizationKpp,
+        });
+        const bank = await resolveOrgBankAccountByNumber(conn, org.ref, orgBankAccountNumber);
+        const counterparty = await resolveCounterpartyByRequisites(conn, {
+          inn: payerInn,
+          kpp: payerKpp,
+        });
+        const payerBank =
+          payerAccountNumber !== undefined
+            ? await resolveCounterpartyBankAccountByNumber(conn, counterparty.ref, payerAccountNumber)
+            : undefined;
+        const contract = await resolveCustomerContract(conn, {
+          orgKey: org.ref,
+          counterpartyRef: counterparty.ref,
+          ...(contractRef ? { contractRef } : {}),
+          ...(contractNumber ? { contractNumber } : {}),
+        });
+        const codes = conn.cfg?.accounting?.strictDefaults
+          ? new Map<AccountDefault, string | undefined>()
+          : await resolveDefaultAccounts(conn, ["receivable", "receivableAdvance"]);
+        const settle = codes.get("receivable");
+        const advance = codes.get("receivableAdvance");
+        if (settle) need(rowProps, "СчетУчетаРасчетовСКонтрагентом_Key", "Edm.Guid", rowSet);
+        if (advance) need(rowProps, "СчетУчетаРасчетовПоАвансам_Key", "Edm.Guid", rowSet);
+        const cpSet = resolveEntity(CATALOGS.counterparties, await conn.available());
+        const normalizedAmount = Math.round(amount * 100) / 100;
+        if (normalizedAmount <= 0) throw new InputError("Сумма оплаты должна быть больше нуля.");
+        const incomingDate = documentDate ? odataDate(new Date(`${documentDate}T00:00:00`)) : undefined;
+        const payload = clean({
+          Date: odataDate(new Date(`${date}T00:00:00`)),
+          Posted: false,
+          ВидОперации: configuredOperationKind(conn.cfg, "customerPayment"),
+          Организация_Key: org.ref,
+          СчетОрганизации_Key: bank.ref,
+          Контрагент: counterparty.ref,
+          ...(cpSet ? { Контрагент_Type: `StandardODATA.${cpSet}` } : {}),
+          ДоговорКонтрагента_Key: contract.ref,
+          ...(purpose !== undefined ? { НазначениеПлатежа: purpose } : {}),
+          ...(documentNumber !== undefined ? { НомерВходящегоДокумента: documentNumber } : {}),
+          ...(incomingDate ? { ДатаВходящегоДокумента: incomingDate } : {}),
+          ...(payerBank ? { СчетКонтрагента_Key: payerBank.ref } : {}),
+          СуммаДокумента: normalizedAmount,
+          РасшифровкаПлатежа: [
+            clean({
+              LineNumber: 1,
+              ДоговорКонтрагента_Key: contract.ref,
+              СпособПогашенияЗадолженности: "Автоматически",
+              СуммаПлатежа: normalizedAmount,
+              СтавкаНДС: vatRateValue,
+              СуммаНДС: vatAmountValue,
+              СчетУчетаРасчетовСКонтрагентом_Key: settle,
+              СчетУчетаРасчетовПоАвансам_Key: advance,
+            }),
+          ],
+        });
+        const notes: string[] = [];
+        if (payerName && payerName !== counterparty.name)
+          notes.push(
+            `Наименование плательщика в источнике «${payerName}», в 1С «${counterparty.name}» — сверьте перед проведением.`,
+          );
+        notes.push(
+          explicitVat
+            ? `НДС переносится явно: ставка ${vatRateValue}, сумма ${vatAmountValue}.`
+            : "НДС в источнике не задан: выставлены «БезНДС» и 0 — как у обычной оплаты покупателя.",
+        );
+        const created = await createOrPreview(conn, set, payload, confirm, notes, {
+          settlementSide: "customer",
+        });
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        if (!createdData || created.isError) return created;
+        const resolved = {
+          sourceKey,
+          organization: { ref: org.ref, name: org.name },
+          bankAccount: { ref: bank.ref, number: bank.number },
+          counterparty: { ref: counterparty.ref, name: counterparty.name },
+          ...(payerBank ? { payerBankAccount: { ref: payerBank.ref, number: payerBank.number } } : {}),
+          contract: {
+            ref: contract.ref,
+            ...(contract.number ? { number: contract.number } : {}),
+            ...(contract.kind ? { kind: contract.kind } : {}),
+          },
+          vat: { rate: vatRateValue, amount: vatAmountValue, explicit: explicitVat },
+        };
+        // Что именно проверяем контрольным чтением: только явно перенесённые/заполненные нами поля.
+        // Счета расчётов MCP может уточнить по настройке договора — их сверяет отдельный путь.
+        const expectedHeader: Record<string, unknown> = {
+          Организация_Key: org.ref,
+          СчетОрганизации_Key: bank.ref,
+          Контрагент: counterparty.ref,
+          ДоговорКонтрагента_Key: contract.ref,
+          ВидОперации: payload["ВидОперации"],
+          СуммаДокумента: normalizedAmount,
+          ...(purpose !== undefined ? { НазначениеПлатежа: purpose } : {}),
+          ...(documentNumber !== undefined ? { НомерВходящегоДокумента: documentNumber } : {}),
+          ...(incomingDate ? { ДатаВходящегоДокумента: incomingDate } : {}),
+          ...(payerBank ? { СчетКонтрагента_Key: payerBank.ref } : {}),
+        };
+        const expectedRow: Record<string, unknown> = {
+          ДоговорКонтрагента_Key: contract.ref,
+          СпособПогашенияЗадолженности: "Автоматически",
+          СуммаПлатежа: normalizedAmount,
+          СтавкаНДС: vatRateValue,
+          СуммаНДС: vatAmountValue,
+        };
+        const verificationPlan = [
+          ...Object.keys(expectedHeader),
+          ...Object.keys(expectedRow).map((f) => `РасшифровкаПлатежа.${f}`),
+        ];
+        if (!confirm || createdData.dryRun === true)
+          return withStructured(created, { resolved, verificationPlan });
+        const ref = typeof createdData.ref === "string" ? createdData.ref : "";
+        if (!ref)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              {
+                type: "text",
+                text:
+                  "1С приняла запрос, но ответ не содержит Ref_Key созданного документа. " +
+                  "Повторная запись заблокирована; проверьте документ в 1С вручную.",
+              },
+            ],
+            structuredContent: { ...createdData, resolved, verification: "failed" },
+          };
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Документ создан (Ref_Key ${ref}), но перечитать его не удалось: ${reason}. ` +
+                  "Повторная запись заблокирована; проверьте поля в 1С вручную.",
+              },
+            ],
+            structuredContent: {
+              ...createdData,
+              resolved,
+              verification: "failed",
+              verificationNote: "Контрольное чтение не выполнено.",
+            },
+          };
+        }
+        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
+        const compare = (field: string, expected: unknown, where: "header" | "row"): void => {
+          const props = where === "header" ? headerProps : rowProps;
+          const type = props.get(field) ?? "Edm.String";
+          const actualValue = where === "header" ? actual[field] : rowValue(actual, field);
+          if (!sameStoredValue(expected, actualValue, type))
+            mismatches.push({
+              field: where === "row" ? `РасшифровкаПлатежа.${field}` : field,
+              expected,
+              actual: actualValue,
+            });
+        };
+        for (const [field, value] of Object.entries(expectedHeader)) compare(field, value, "header");
+        for (const [field, value] of Object.entries(expectedRow)) compare(field, value, "row");
+        if (mismatches.length)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Документ создан (Ref_Key ${ref}), но контрольное чтение не подтвердило поля: ` +
+                  `${mismatches.map((m) => m.field).join(", ")}. Повторная запись заблокирована; ` +
+                  "исправьте документ в 1С вручную и не запускайте загрузку этого sourceKey заново как новую.",
+              },
+            ],
+            structuredContent: {
+              ...createdData,
+              resolved,
+              verification: "failed",
+              mismatches,
+              verificationNote: "Поля после создания отличаются от явных полей источника.",
+            },
+          };
+        return withStructured(created, {
+          resolved,
+          verification: "ok",
+          verifiedFields: verificationPlan,
+        });
+      }),
+  );
+
   // === Фаза 2: денежные документы (списание с р/с, ПКО, РКО) ===
 
   /**
@@ -4041,6 +4439,220 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               }
             : undefined,
         );
+      }),
+  );
+
+  server.registerTool(
+    "write.organization.create_bank_account",
+    {
+      title: "Сопоставить или создать банковский счёт организации",
+      description:
+        "Нужен перед банковским поступлением, когда у организации ещё нет счёта в 1С. Сначала точным " +
+        "проходом сопоставляет счёт именно организации по номеру (Owner_Type = Catalog_Организации); " +
+        "если он есть — ничего не пишет и возвращает existing=true. Если счёта нет — создаёт его в том же " +
+        "справочнике «Банковские счета» с владельцем-организацией (Owner = Ref_Key организации), а не " +
+        "контрагентом. Dry-run по умолчанию. Счёт контрагента за счёт организации не выдаётся: владелец " +
+        "проверяется до и после записи. makeMain обновляет ОсновнойБанковскийСчет организации отдельным PATCH.",
+      inputSchema: z.object({
+        database: databaseField,
+        organizationRef: z.string().uuid().describe("Ref_Key организации-владельца счёта"),
+        accountNumber: z.string().trim().describe("Точный номер расчётного счёта (20 цифр)"),
+        bik: z.string().trim().describe("БИК банка (ищется в справочнике «Банки»)"),
+        currency: z.string().optional().describe("Валюта (код/название; по умолчанию рубль)"),
+        label: z.string().optional().describe("Наименование счёта (по умолчанию — номер счёта)"),
+        makeMain: z.boolean().default(false).describe("Сделать основным счётом организации"),
+        confirm: confirmField,
+      }),
+      outputSchema: createResultSchema,
+    },
+    ({ database, organizationRef, accountNumber, bik, currency, label, makeMain, confirm }) =>
+      guard("write.organization.create_bank_account", async () => {
+        const conn = ctx.db(database);
+        const set = await requireEntity(conn, CATALOGS.bankAccounts, "Справочник «Банковские счета»");
+        const meta = await conn.getMetadata();
+        const accMeta = meta.entities.get(set);
+        const need = (field: string, type: string): void => {
+          const actual = accMeta?.properties.find((p) => p.name === field)?.type;
+          if (actual !== type)
+            throw new InputError(
+              `Схема «Банковские счета» не публикует поле ${field} с типом ${type}` +
+                (actual ? ` (найдено ${actual})` : "") +
+                ". Безопасное создание счёта организации невозможно — операция не начата.",
+            );
+        };
+        need("Description", "Edm.String");
+        need("Owner", "Edm.String");
+        need("Owner_Type", "Edm.String");
+        need("НомерСчета", "Edm.String");
+        need("Банк_Key", "Edm.Guid");
+        need("ВалютаДенежныхСредств_Key", "Edm.Guid");
+        const orgSet = await resolveSet(conn, CATALOGS.organizations, "Организации");
+        const orgMeta = meta.entities.get(orgSet);
+        if (
+          makeMain &&
+          orgMeta?.properties.find((p) => p.name === "ОсновнойБанковскийСчет_Key")?.type !== "Edm.Guid"
+        )
+          throw new InputError(
+            "Схема организации не публикует «ОсновнойБанковскийСчет_Key» — сделать счёт основным нельзя. " +
+              "Создайте его без makeMain.",
+          );
+        const orgRef = organizationRef.replace(/[{}']/g, "").toLowerCase();
+        let orgDoc: ODataEntity;
+        try {
+          orgDoc = await conn.client.getEntity(
+            `${orgSet}(${odataGuid(orgRef)})?$format=json&$select=Ref_Key,Description,DeletionMark` +
+              (makeMain ? ",ОсновнойБанковскийСчет_Key" : ""),
+          );
+        } catch (error) {
+          if (error instanceof ODataError && error.kind === "not_found")
+            throw new InputError(`Организация ${orgRef} не найдена — счёт создать не для кого.`);
+          throw error;
+        }
+        if (orgDoc.DeletionMark === true) throw new InputError("Организация помечена на удаление.");
+        if (String(orgDoc.Ref_Key).toLowerCase() !== orgRef)
+          throw new InputError("1С вернула другую организацию — счёт не создан.");
+        const existing = await findBankAccountsByOwnerAndNumber(conn, orgRef, accountNumber);
+        if (existing.truncated)
+          return fail(
+            "Банковские счета: достигнут предел строк, проход неполный. Нельзя утверждать, " +
+              "что счёт с таким номером один. Увеличьте ODATA_MAX_ROWS.",
+            "input",
+          );
+        if (existing.accounts.length > 1)
+          return fail(
+            `У организации несколько счетов с номером ${accountNumber} — исправьте справочник 1С.`,
+            "refused",
+          );
+        const ownerType = `StandardODATA.${orgSet}`;
+        const found = existing.accounts[0];
+        if (found)
+          return ok({
+            existing: true,
+            database: conn.cfg.name,
+            entitySet: set,
+            ref: found.ref,
+            description: found.name,
+            ownerRef: orgRef,
+            ownerType,
+            note: "Счёт организации с таким номером уже есть; запись не выполнялась.",
+          });
+        const bank = await resolveBankByBik(conn, bik);
+        const cur = currency
+          ? await resolveCatalogItem(conn, CATALOGS.currencies, "Справочник «Валюты»", currency)
+          : await resolveCatalogItem(conn, CATALOGS.currencies, "Справочник «Валюты»", "643");
+        const payload = clean({
+          Description: label ?? accountNumber,
+          Owner: orgRef,
+          Owner_Type: ownerType,
+          НомерСчета: accountNumber,
+          Банк_Key: bank.ref,
+          ВалютаДенежныхСредств_Key: cur.ref,
+        });
+        const result = await createSubordinate(
+          conn,
+          set,
+          payload,
+          confirm,
+          makeMain
+            ? {
+                ownerSet: orgSet,
+                ownerRef: orgRef,
+                field: "ОсновнойБанковскийСчет_Key",
+              }
+            : undefined,
+        );
+        const data = result.structuredContent as Record<string, unknown> | undefined;
+        if (result.isError || !data) return result;
+        if (data.dryRun === true)
+          return withStructured(result, {
+            ownerRef: orgRef,
+            ownerType,
+            diagnostic:
+              "Счёт организации будет создан в «Банковских счетах» с Owner = организация и " +
+              `Owner_Type = ${ownerType}; это не счёт контрагента.`,
+          });
+        if (data.created !== true) return result;
+        const ref = typeof data.ref === "string" ? data.ref : "";
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(
+            `${set}(${odataGuid(ref)})?$format=json&$select=Ref_Key,Owner,Owner_Type,НомерСчета,Description`,
+          );
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return {
+            ...result,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Счёт создан (Ref_Key ${ref}), но перечитать его не удалось: ${reason}. ` +
+                  "Повторная запись заблокирована; проверьте владельца счёта в 1С вручную.",
+              },
+            ],
+            structuredContent: { ...data, ownerRef: orgRef, ownerType, verification: "failed" },
+          };
+        }
+        const sameOwner =
+          String(actual.Owner ?? "").toLowerCase() === orgRef &&
+          String(actual.Owner_Type ?? "") === ownerType;
+        if (!sameOwner)
+          return {
+            ...result,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Счёт создан (Ref_Key ${ref}), но владелец не совпал: Owner_Type=${String(actual.Owner_Type ?? "—")}, ` +
+                  `Owner=${String(actual.Owner ?? "—")}; ожидался ${ownerType} / ${orgRef}. ` +
+                  "Не используйте этот счёт как счёт организации; проверьте 1С вручную.",
+              },
+            ],
+            structuredContent: {
+              ...data,
+              ownerRef: orgRef,
+              ownerType,
+              verification: "failed",
+              actualOwner: String(actual.Owner ?? ""),
+              actualOwnerType: String(actual.Owner_Type ?? ""),
+            },
+          };
+        if (makeMain) {
+          let main: unknown;
+          try {
+            const orgNow = await conn.client.getEntity(
+              `${orgSet}(${odataGuid(orgRef)})?$format=json&$select=ОсновнойБанковскийСчет_Key`,
+            );
+            main = orgNow["ОсновнойБанковскийСчет_Key"];
+          } catch {
+            main = undefined;
+          }
+          if (String(main ?? "").toLowerCase() !== ref.toLowerCase())
+            return {
+              ...result,
+              isError: true,
+              _meta: { "odata-1c/errorKind": "refused" },
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Счёт создан (Ref_Key ${ref}), но основным счётом организации не стал. ` +
+                    "Проверьте поле «Основной банковский счёт» в 1С вручную.",
+                },
+              ],
+              structuredContent: { ...data, ownerRef: orgRef, ownerType, verification: "failed" },
+            };
+        }
+        return withStructured(result, {
+          ownerRef: orgRef,
+          ownerType,
+          verification: "ok",
+          note: "Создан счёт именно организации; владелец проверен контрольным чтением.",
+        });
       }),
   );
 

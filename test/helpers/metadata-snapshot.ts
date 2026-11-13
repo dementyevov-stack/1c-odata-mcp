@@ -85,13 +85,81 @@ export function snapshotConnection(env: Record<string, string> = {}): Connection
     DeletionMark: false,
     Товары: [row, { ...row, LineNumber: "2" }],
   });
-  vi.spyOn(conn.client, "getCollection").mockImplementation(async (path: string) => ({
-    value: path.startsWith("ChartOfAccounts_")
-      ? ["41.01", "60.01", "60.02", "62.01", "62.02", "90.01.1", "90.02.1", "91.01", "91.02", "94"].map(
-          (Code) => ({ Ref_Key: id, Code, Description: Code }),
-        )
-      : [{ Ref_Key: id, Description: "Synthetic", Code: "1", Owner_Key: id }],
-  }));
+  vi.spyOn(conn.client, "getCollection").mockImplementation(async (path: string) => {
+    const base = path.split("?")[0]!;
+    if (path.startsWith("ChartOfAccounts_"))
+      return {
+        value: [
+          "41.01",
+          "60.01",
+          "60.02",
+          "62.01",
+          "62.02",
+          "90.01.1",
+          "90.02.1",
+          "91.01",
+          "91.02",
+          "94",
+        ].map((Code) => ({ Ref_Key: id, Code, Description: Code })),
+      };
+    if (base === "Catalog_Организации")
+      return {
+        value: [
+          {
+            Ref_Key: id,
+            Description: "Synthetic",
+            ИНН: "7700000000",
+            КПП: "770000001",
+            DeletionMark: false,
+          },
+        ],
+      };
+    if (base === "Catalog_Контрагенты")
+      return {
+        value: [
+          {
+            Ref_Key: id,
+            Description: "Synthetic",
+            ИНН: "7800000000",
+            КПП: "780000001",
+            DeletionMark: false,
+            IsFolder: false,
+          },
+        ],
+      };
+    if (base === "Catalog_ДоговорыКонтрагентов")
+      return {
+        value: [
+          {
+            Ref_Key: id,
+            Description: "Synthetic",
+            Номер: "D-1",
+            ВидДоговора: "СПокупателем",
+            Owner_Key: id,
+            Организация_Key: id,
+            DeletionMark: false,
+            IsFolder: false,
+          },
+        ],
+      };
+    if (base === "Catalog_БанковскиеСчета")
+      return {
+        value: [
+          {
+            Ref_Key: id,
+            Description: "Synthetic",
+            НомерСчета: "40702810000000000001",
+            Owner: id,
+            Owner_Type: "StandardODATA.Catalog_Организации",
+            DeletionMark: false,
+          },
+        ],
+      };
+    if (base === "Catalog_Валюты") return { value: [{ Ref_Key: id, Code: "643", Description: "Рубль" }] };
+    if (base === "Catalog_Банки")
+      return { value: [{ Ref_Key: id, Code: "044525225", Description: "Synthetic bank" }] };
+    return { value: [{ Ref_Key: id, Description: "Synthetic", Code: "1", Owner_Key: id }] };
+  });
   vi.spyOn(conn.client, "getText").mockResolvedValue("");
   return conn;
 }
@@ -179,6 +247,29 @@ export const CREATE_CASES: Array<[string, Record<string, unknown>]> = [
   [
     "write.money.create_payout_order",
     { counterpartyRef: SNAPSHOT_REF, amount: 1, number: "1", purposeText: "тест", recipientText: "тест" },
+  ],
+  [
+    "write.money.create_payment_from_statement",
+    {
+      sourceKey: "synthetic-1",
+      organizationInn: "7700000000",
+      organizationKpp: "770000001",
+      orgBankAccountNumber: "40702810000000000001",
+      payerInn: "7800000000",
+      payerKpp: "780000001",
+      amount: 1,
+      date: "2026-09-01",
+      vatRate: "НДС20",
+      vatAmount: 0.15,
+    },
+  ],
+  [
+    "write.organization.create_bank_account",
+    {
+      organizationRef: SNAPSHOT_REF,
+      accountNumber: "40702810000000000002",
+      bik: "044525225",
+    },
   ],
   ["write.counterparty.create_counterparty", { name: "Тест" }],
   ["write.catalog.create_nomenclature", { name: "Тест" }],

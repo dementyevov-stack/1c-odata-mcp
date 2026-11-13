@@ -119,6 +119,26 @@ const OVERRIDES: Record<string, Record<string, unknown>> = {
   "write.accounting.set_settlement_settings": { ...SETTINGS_SCOPE, ...SETTINGS_UPDATE, scope: "contract" },
   "write.accounting.set_contract_settlement_settings": { ...SETTINGS_SCOPE, ...SETTINGS_UPDATE },
   "write.operation.status": { operationId: "00000000-0000-4000-8000-000000000000" },
+  "read.system.list_organizations": { inn: "7700000000", kpp: "770000001" },
+  "read.organization.find_bank_account": {
+    organization: id,
+    accountNumber: "40702810000000000001",
+  },
+  "write.money.create_payment_from_statement": {
+    sourceKey: "synthetic-1",
+    organizationInn: "7700000000",
+    organizationKpp: "770000001",
+    orgBankAccountNumber: "40702810000000000001",
+    payerInn: "7800000000",
+    payerKpp: "780000001",
+    amount: 1,
+    date: "2026-09-01",
+  },
+  "write.organization.create_bank_account": {
+    organizationRef: id,
+    accountNumber: "40702810000000000002",
+    bik: "044525225",
+  },
 };
 
 /** Значение аргумента по имени и схеме поля. */
@@ -128,7 +148,7 @@ function valueFor(name: string, s: Schema): unknown {
   if (name === "line") return line;
   if (/Ref$|^ref$/.test(name)) return id;
   if (name === "month") return "2026-09";
-  if (/^(from|date|asOf|incomingDate)$/.test(name)) return "2026-09-01";
+  if (/^(from|date|asOf|incomingDate|documentDate)$/.test(name)) return "2026-09-01";
   if (name === "to") return "2026-09-30";
   if (name === "accountNumber") return "40702810000000000001";
   if (name === "bik") return "044525225";

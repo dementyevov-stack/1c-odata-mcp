@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { ServerContext } from "../context.js";
 import { ok, fail, guard, databaseField, offsetField, pageOf, snapshotField, toolListed } from "./_shared.js";
-import { listOrganizations } from "../odata/orgs.js";
+import { findOrganizationsByRequisites, listOrganizations } from "../odata/orgs.js";
 import type { EntityClass } from "../types/odata.js";
 import {
   listDatabasesResultSchema,
@@ -106,14 +106,44 @@ export function registerMetaTools(server: McpServer, ctx: ServerContext): void {
       description:
         "Список организаций (юрлиц) внутри выбранной базы 1С. " +
         "Название организации передаётся в параметр organization аналитических инструментов " +
-        "(get_sales, get_debtors, get_cashflow, get_inventory и др.), чтобы получить данные по одному юрлицу.",
-      inputSchema: z.object({ database: databaseField }),
+        "(get_sales, get_debtors, get_cashflow, get_inventory и др.), чтобы получить данные по одному юрлицу. " +
+        "Для точной сверки задайте ИНН (и при необходимости КПП): сервер прочитает справочник страницами " +
+        "и сверит реквизиты локально, без $top=1. Если фильтр по ИНН у публикации отвечает HTTP 500, " +
+        "будет выполнен ограниченный полный проход. Неполный проход — отказ, а не догадка.",
+      inputSchema: z.object({
+        database: databaseField,
+        inn: z.string().trim().optional().describe("Точный ИНН организации (10 или 12 цифр)"),
+        kpp: z.string().trim().optional().describe("Точный КПП организации (9 цифр); только вместе с ИНН"),
+      }),
       outputSchema: listOrganizationsResultSchema,
     },
-    ({ database }) =>
+    ({ database, inn, kpp }) =>
       guard("read.system.list_organizations", async () => {
-        const orgs = await listOrganizations(ctx.db(database));
-        return ok({ count: orgs.length, organizations: orgs });
+        const conn = ctx.db(database);
+        if (!inn && !kpp) {
+          const orgs = await listOrganizations(conn);
+          return ok({ count: orgs.length, organizations: orgs });
+        }
+        if (!inn) return fail("КПП без ИНН не задаёт организацию: укажите ИНН.", "input");
+        if (kpp && !/^\d{9}$/.test(kpp)) return fail("КПП организации должен содержать 9 цифр.", "input");
+        if (!/^\d{10}$|^\d{12}$/.test(inn))
+          return fail("ИНН организации должен содержать 10 или 12 цифр.", "input");
+        const found = await findOrganizationsByRequisites(conn, { inn, kpp });
+        if (found.truncated)
+          return fail(
+            `Организации: прочитано ${found.scanned} строк и достигнут предел — проход неполный. ` +
+              "Нельзя утверждать, что подходящая организация одна. Увеличьте ODATA_MAX_ROWS или уточните КПП.",
+            "input",
+          );
+        return ok({
+          count: found.organizations.length,
+          organizations: found.organizations,
+          scanned: found.scanned,
+          strategy: found.strategy,
+          ...(found.filterError
+            ? { note: "Фильтр по ИНН в 1С ответил 500; выполнен ограниченный полный проход." }
+            : {}),
+        });
       }),
   );
 

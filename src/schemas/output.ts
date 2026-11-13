@@ -217,6 +217,21 @@ export const listOrganizationsResultSchema = z
   })
   .passthrough();
 
+export const bankAccountLookupResultSchema = z
+  .object({
+    database: z.string(),
+    organization: z.object({ ref: z.string(), name: z.string() }).passthrough(),
+    accountNumber: z.string(),
+    found: z.boolean(),
+    account: z
+      .object({ ref: z.string(), number: z.string(), name: z.string().optional() })
+      .passthrough()
+      .optional(),
+    ownerType: z.string().optional(),
+    note: z.string().optional(),
+  })
+  .passthrough();
+
 export const listEntitiesResultSchema = z
   .object({
     database: z.string(),
