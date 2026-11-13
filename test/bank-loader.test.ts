@@ -356,6 +356,27 @@ describe("подготовка оплаты покупателя", () => {
     expect(await journal.get(source.sourceKey)).toMatchObject({ state: "created" });
   });
 
+  it("потерянный POST: отличие только во времени документа ловится сверкой", async () => {
+    const { client, fake, journal } = await fixture({ dropPostResponse: true });
+    const first = await prepareAndConfirm(client, target, source, journal);
+    expect(first.documents[0]?.action).toBe("unknown");
+    const original = fake.conn.client.getEntity.bind(fake.conn.client);
+    vi.spyOn(fake.conn.client, "getEntity").mockImplementation(async (path: string) => {
+      const actual = await original(path);
+      if (path.startsWith("Document_ПоступлениеНаРасчетныйСчет(") && !path.includes("$select"))
+        return { ...actual, Date: "2026-11-01T00:00:00" };
+      return actual;
+    });
+    const resumed = await runPackage(client, target, [source], journal, {
+      confirm: true,
+      mode: "resume",
+    });
+    expect(resumed.documents[0]?.action).toBe("reconciled");
+    expect(resumed.documents[0]?.verification).toBe("failed");
+    expect(JSON.stringify(resumed.documents[0]?.mismatches)).toContain('"Date"');
+    expect(postCount(fake)).toBe(1);
+  });
+
   it("расхождение контрольного чтения по НДС: документ не дублируется, но помечается failed", async () => {
     const { client, fake, journal } = await fixture();
     const original = fake.conn.client.getEntity.bind(fake.conn.client);

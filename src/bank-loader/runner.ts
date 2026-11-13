@@ -513,6 +513,17 @@ function expectedFromPayload(payload: Record<string, unknown> | undefined): Bank
 }
 
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Допустимый Edm.DateTime 1С: дата, необязательное время, необязательные доли секунды. */
+const DATE_RE = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?$/;
+
+function dateParts(value: unknown): { date: string; time?: string } | undefined {
+  const m = DATE_RE.exec(String(value ?? "").trim());
+  if (!m) return undefined;
+  return {
+    date: m[1]!,
+    ...(m[2] !== undefined ? { time: `${m[2]}:${m[3]}:${m[4] ?? "00"}` } : {}),
+  };
+}
 
 /** Сравнение сохранённого значения с планом без типа Edm: GUID, даты, числа, строки. */
 function samePlannedValue(expected: unknown, actual: unknown): boolean {
@@ -524,7 +535,14 @@ function samePlannedValue(expected: unknown, actual: unknown): boolean {
   const a = String(actual ?? "").trim();
   if (!e) return !a;
   if (GUID_RE.test(e)) return a.toLowerCase() === e.toLowerCase();
-  if (/^\d{4}-\d{2}-\d{2}/.test(e)) return a.slice(0, 10) === e.slice(0, 10);
+  const expectedDate = dateParts(e);
+  if (expectedDate) {
+    const actualDate = dateParts(a);
+    if (!actualDate) return false;
+    // Date-only вход сверяем по дню; полный Date — по дате и точному времени.
+    if (!expectedDate.time) return actualDate.date === expectedDate.date;
+    return actualDate.date === expectedDate.date && (actualDate.time ?? "00:00:00") === expectedDate.time;
+  }
   return a === e;
 }
 
