@@ -7972,7 +7972,7 @@
     {
       "name": "write.sales.create_shipment",
       "title": "Создать реализацию покупателю",
-      "description": "Создаёт документ «Реализация товаров и услуг» (отгрузка покупателю) с табличной частью «Товары». Документ НЕПРОВЕДЁННЫЙ; провести — вручную в 1С или post_document (тогда 1С сформирует проводки Дт 62 Кт 90, Дт 90 Кт 41 и др.; счёт расчётов — по настройке договора, источник виден в предпросмотре). Позиции могут нести content (Содержание строки — печатается в УПД) и свои счета доходов/расходов. По умолчанию dry-run; создание — при confirm=true. Контрагент — покупатель, договор — вида «СПокупателем».",
+      "description": "Создаёт документ «Реализация товаров и услуг» (отгрузка покупателю) с табличной частью «Товары». Документ НЕПРОВЕДЁННЫЙ; провести — вручную в 1С или post_document (тогда 1С сформирует проводки Дт 62 Кт 90, Дт 90 Кт 41 и др.; счёт расчётов — по настройке договора, источник виден в предпросмотре). Позиции могут нести content (Содержание строки — печатается в УПД) и свои счета доходов/расходов. Исторический opt-in: две таблицы «Товары»/«Услуги», явный проверенный вид операции, Number/Date со временем, пустой счёт организации, итог net+VAT, счета 62.01/62.02 и счета строк, УПД/вид ЭД и полный readback. По умолчанию dry-run; создание — при confirm=true. Контрагент — покупатель, договор — вида «СПокупателем».",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -8014,7 +8014,7 @@
             "type": "string"
           },
           "lines": {
-            "minItems": 1,
+            "description": "Товарные строки",
             "type": "array",
             "items": {
               "type": "object",
@@ -8041,23 +8041,105 @@
                     "БезНДС",
                     "НДС0",
                     "НДС5",
+                    "НДС5_105",
                     "НДС7",
+                    "НДС7_107",
                     "НДС10",
+                    "НДС10_110",
+                    "НДС18",
+                    "НДС18_118",
                     "НДС20",
-                    "НДС22"
+                    "НДС20_120",
+                    "НДС22",
+                    "НДС22_122"
                   ]
                 },
                 "content": {
                   "description": "Содержание строки (реквизит «Содержание») — именно этот текст печатается в счёте и УПД. Для услуг заполняйте обязательно, напр. «Услуги согласно приложению № 4 от 01.10.2025 г. к договору № 87 от 01.12.2023 г. за июль 2026 г.». 1С сама это поле НЕ заполняет.",
                   "type": "string"
                 },
-                "incomeAccount": {
-                  "description": "Счёт доходов — код плана счетов как в 1С (напр. «90.01.1» или «90.01.2») либо Ref_Key счёта. Без указания берётся из регистра «Счета учёта номенклатуры», иначе 90.01.1.",
-                  "type": "string"
+                "amount": {
+                  "description": "Явная сумма строки",
+                  "type": "number",
+                  "minimum": 0
                 },
-                "expenseAccount": {
-                  "description": "Счёт расходов (себестоимости) — код как в 1С (напр. «90.02.1» или «90.02.2») либо Ref_Key. Без указания берётся из регистра «Счета учёта номенклатуры», иначе 90.02.1.",
-                  "type": "string"
+                "vatAmount": {
+                  "description": "Явная сумма НДС",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "sourceLineId": {
+                  "description": "ИдентификаторСтроки",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "unitRef": {
+                  "description": "ЕдиницаИзмерения_Key",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "coefficient": {
+                  "description": "Коэффициент",
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "countryOfOriginRef": {
+                  "description": "СтранаПроисхождения_Key",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "accountingGroup": {
+                  "description": "Номенклатурная группа (Субконто)",
+                  "maxItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "ref": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "description": "Ref_Key аналитики"
+                      },
+                      "type": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": "Тип ссылки аналитики"
+                      }
+                    },
+                    "required": [
+                      "ref",
+                      "type"
+                    ]
+                  }
+                },
+                "inventoryAccountRef": {
+                  "description": "СчетУчета_Key (41.01)",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "incomeAccountRef": {
+                  "description": "СчетДоходов_Key (90.01.1)",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "expenseAccountRef": {
+                  "description": "СчетРасходов_Key (90.02.1)",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "vatAccountRef": {
+                  "description": "СчетУчетаНДСПоРеализации_Key (90.03)",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
                 }
               },
               "required": [
@@ -8065,8 +8147,7 @@
                 "quantity",
                 "price"
               ]
-            },
-            "description": "Позиции документа"
+            }
           },
           "confirm": {
             "default": false,
@@ -8077,6 +8158,168 @@
             "description": "Банковский счёт организации — печатается в документе как реквизиты для оплаты. Название/номер счёта (напр. «Сбербанк» или «40802…») либо Ref_Key. Без указания берётся ОСНОВНОЙ счёт организации.",
             "type": "string"
           },
+          "serviceLines": {
+            "description": "Сервисные строки «Услуги»",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "nomenclatureRef": {
+                  "type": "string",
+                  "description": "Ref_Key номенклатуры"
+                },
+                "quantity": {
+                  "description": "Количество; при emptyQuantity не задаётся",
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "price": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Цена за единицу"
+                },
+                "vatRate": {
+                  "default": "БезНДС",
+                  "description": "Ставка НДС",
+                  "type": "string",
+                  "enum": [
+                    "БезНДС",
+                    "НДС0",
+                    "НДС5",
+                    "НДС5_105",
+                    "НДС7",
+                    "НДС7_107",
+                    "НДС10",
+                    "НДС10_110",
+                    "НДС18",
+                    "НДС18_118",
+                    "НДС20",
+                    "НДС20_120",
+                    "НДС22",
+                    "НДС22_122"
+                  ]
+                },
+                "content": {
+                  "description": "Содержание строки (реквизит «Содержание») — именно этот текст печатается в счёте и УПД. Для услуг заполняйте обязательно, напр. «Услуги согласно приложению № 4 от 01.10.2025 г. к договору № 87 от 01.12.2023 г. за июль 2026 г.». 1С сама это поле НЕ заполняет.",
+                  "type": "string"
+                },
+                "emptyQuantity": {
+                  "description": "Opt-in: количество в источнике пустое",
+                  "type": "boolean"
+                },
+                "amount": {
+                  "description": "Явная сумма строки",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "vatAmount": {
+                  "description": "Явная сумма НДС",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "sourceLineId": {
+                  "description": "ИдентификаторСтроки",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "accountingGroup": {
+                  "description": "Номенклатурная группа (Субконто)",
+                  "maxItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "ref": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "description": "Ref_Key аналитики"
+                      },
+                      "type": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": "Тип ссылки аналитики"
+                      }
+                    },
+                    "required": [
+                      "ref",
+                      "type"
+                    ]
+                  }
+                },
+                "incomeAccountRef": {
+                  "description": "СчетДоходов_Key",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "expenseAccountRef": {
+                  "description": "СчетРасходов_Key",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "vatAccountRef": {
+                  "description": "СчетУчетаНДСПоРеализации_Key",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                }
+              },
+              "required": [
+                "nomenclatureRef",
+                "price"
+              ]
+            }
+          },
+          "number": {
+            "description": "Исторический номер",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "time": {
+            "description": "Время документа",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "operationKind": {
+            "description": "Явный проверенный вид операции",
+            "type": "string",
+            "enum": [
+              "Товары",
+              "Услуги"
+            ]
+          },
+          "universalDocument": {
+            "description": "ЭтоУниверсальныйДокумент",
+            "type": "boolean"
+          },
+          "electronicDocumentType": {
+            "description": "ВидЭлектронногоДокумента",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "documentTotal": {
+            "description": "Точный итог net+VAT",
+            "type": "number",
+            "minimum": 0
+          },
+          "settlementAccountRef": {
+            "description": "Счёт расчётов 62.01",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "advanceAccountRef": {
+            "description": "Счёт авансов 62.02",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
           "operationId": {
             "description": "UUID из предпросмотра. Передайте его при confirm=true, чтобы повтор не создал дубликат.",
             "type": "string",
@@ -8085,8 +8328,7 @@
           }
         },
         "required": [
-          "counterpartyRef",
-          "lines"
+          "counterpartyRef"
         ],
         "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
