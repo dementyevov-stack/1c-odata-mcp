@@ -3089,8 +3089,42 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
     vatAccountRef: z.string().uuid().optional().describe("Ref_Key счёта учёта входящего НДС"),
     unitRef: z.string().uuid().optional().describe("Ref_Key единицы измерения (ЕдиницаИзмерения_Key)"),
     coefficient: z.number().positive().optional().describe("Явный коэффициент (Коэффициент)"),
+    countryOfOriginRef: z.string().uuid().optional().describe("Ref_Key страны происхождения товара"),
     warehouseEmpty: z.boolean().optional().describe("Opt-in: склад строки пустой (склад только в шапке)"),
   });
+
+  const purchaseAnalytic = z.object({
+    ref: z.string().uuid().describe("Ref_Key аналитики"),
+    type: z.string().trim().min(1).max(200).describe("Тип ссылки, напр. StandardODATA.Catalog_Контрагенты"),
+  });
+  const historicalPurchaseServiceLine = z
+    .object({
+      ...baseLineShape,
+      quantity: z.number().positive().optional().describe("Количество; при emptyQuantity не задаётся"),
+      emptyQuantity: z.boolean().optional().describe("Opt-in: количество в источнике пустое"),
+      vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические"),
+      amount: z.number().nonnegative().optional().describe("Явная сумма строки"),
+      vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
+      sourceLineId: z.string().trim().min(1).max(200).optional().describe("ИдентификаторСтроки источника"),
+      costAccountRef: z.string().uuid().optional().describe("Ref_Key счёта затрат БУ"),
+      costAccountNuRef: z.string().uuid().optional().describe("Ref_Key счёта затрат НУ"),
+      vatAccountRef: z.string().uuid().optional().describe("Ref_Key счёта входящего НДС"),
+      analytics: z.array(purchaseAnalytic).max(3).optional().describe("Субконто БУ1..3"),
+      analyticsNu: z.array(purchaseAnalytic).max(3).optional().describe("СубконтоНУ1..3"),
+    })
+    .superRefine((line, ctx) => {
+      if (line.emptyQuantity) {
+        if (line.quantity !== undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity нельзя сочетать с quantity." });
+        if (line.amount === undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity требует явную amount." });
+        if (line.vatAmount === undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity требует явный vatAmount." });
+        return;
+      }
+      if (line.quantity === undefined)
+        ctx.addIssue({ code: "custom", message: "quantity обязателен или задайте emptyQuantity=true." });
+    });
 
   server.registerTool(
     "write.purchase.create_purchase",
@@ -3124,11 +3158,20 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         settlementAccountRef: z.string().uuid().optional().describe("Ref_Key счёта расчётов (60.01)"),
         advanceAccountRef: z.string().uuid().optional().describe("Ref_Key счёта авансов (60.02)"),
         universalDocument: z.boolean().optional().describe("ЭтоУниверсальныйДокумент"),
+        operationKind: z
+          .enum(["Товары", "Услуги", "ПокупкаКомиссия"])
+          .optional()
+          .describe("Исторический ВидОперации; для Товары+Услуги обязателен явный выбор"),
         allowGenericContractKind: z
           .boolean()
           .optional()
           .describe("Явное бизнес-основание принять договор вида «Прочее»"),
-        lines: z.array(historicalPurchaseLine).min(1).describe("Позиции документа"),
+        lines: z.array(historicalPurchaseLine).optional().describe("Товарные позиции документа"),
+        serviceLines: z
+          .array(historicalPurchaseServiceLine)
+          .min(1)
+          .optional()
+          .describe("Сервисные позиции в отдельной таблице «Услуги»"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
@@ -3150,9 +3193,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       settlementAccountRef,
       advanceAccountRef,
       universalDocument,
+      operationKind,
       allowGenericContractKind,
       sumIncludesVat,
       lines,
+      serviceLines,
       confirm,
     }) =>
       guard("write.purchase.create_purchase", async () => {
@@ -3163,6 +3208,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           "Документ «Поступление товаров и услуг»",
         );
         const org = await resolveOrg(conn, organization);
+        const goodsLines = lines ?? [];
         const historical =
           number !== undefined ||
           time !== undefined ||
@@ -3174,8 +3220,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           settlementAccountRef !== undefined ||
           advanceAccountRef !== undefined ||
           universalDocument !== undefined ||
+          operationKind !== undefined ||
           allowGenericContractKind !== undefined ||
-          lines.some(
+          serviceLines?.some((line) => line.emptyQuantity === true) ||
+          goodsLines.some(
             (line) =>
               line.amount !== undefined ||
               line.vatAmount !== undefined ||
@@ -3189,7 +3237,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           );
         if (!historical) {
           const warehouseKey = await resolveWarehouse(conn, warehouse);
-          const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "purchase");
+          const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, goodsLines, "purchase");
           return createGoodsDoc(
             conn,
             set,
@@ -3200,7 +3248,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               warehouseKey,
               date,
               sumIncludesVat,
-              lines,
+              lines: goodsLines,
               settlement,
               lineAccountsFor,
             },
@@ -3212,8 +3260,32 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           throw new InputError(
             "Историческое поступление требует явную date; time без date не подставляет текущую дату.",
           );
+        if (!goodsLines.length && !serviceLines?.length)
+          throw new InputError("Историческое поступление требует товарные или сервисные строки.");
         if (!contractRef) throw new InputError("Историческое поступление требует явный contractRef.");
-        if (!warehouse) throw new InputError("Историческое поступление требует явный warehouse (Ref_Key).");
+        const hasGoods = goodsLines.length > 0;
+        const hasServices = (serviceLines?.length ?? 0) > 0;
+        const serviceOnly = !hasGoods && hasServices;
+        if (hasGoods && hasServices && operationKind === undefined)
+          throw new InputError(
+            "Для исторической комбинации Товары+Услуги укажите operationKind явно: «ПокупкаКомиссия».",
+          );
+        const resolvedOperationKind = operationKind ?? (hasGoods ? "Товары" : "Услуги");
+        if (hasGoods && hasServices && resolvedOperationKind !== "ПокупкаКомиссия")
+          throw new InputError(
+            "Комбинация Товары+Услуги совместима только с operationKind=«ПокупкаКомиссия».",
+          );
+        if (
+          hasGoods &&
+          !hasServices &&
+          resolvedOperationKind !== "Товары" &&
+          resolvedOperationKind !== "ПокупкаКомиссия"
+        )
+          throw new InputError("Товарная таблица совместима с operationKind «Товары»/«ПокупкаКомиссия».");
+        if (!hasGoods && hasServices && resolvedOperationKind === "Товары")
+          throw new InputError("Для таблицы «Услуги» operationKind «Товары» несовместим.");
+        if (!serviceOnly && !warehouse)
+          throw new InputError("Историческое поступление требует явный warehouse (Ref_Key).");
         const contract = await resolveCustomerContract(conn, {
           orgKey: org.key,
           counterpartyRef,
@@ -3231,7 +3303,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
                 "Для вида «Прочее» требуется явное allowGenericContractKind=true.",
             );
         }
-        const warehouseKey = await resolveWarehouse(conn, warehouse);
+        const warehouseKey = warehouse
+          ? await resolveWarehouse(conn, warehouse)
+          : serviceOnly
+            ? EMPTY_GUID
+            : undefined;
         if (!warehouseKey) throw new InputError("Склад не найден.");
         const props = new Map(
           (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
@@ -3278,19 +3354,95 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ["СчетУчетаНДС_Key", "Edm.Guid"],
         ] as const)
           needRow(field, type);
-        if (lines.some((l) => l.sourceLineId !== undefined)) needRow("ИдентификаторСтроки", "Edm.String");
-        if (lines.some((l) => l.unitRef !== undefined)) needRow("ЕдиницаИзмерения_Key", "Edm.Guid");
-        if (lines.some((l) => l.coefficient !== undefined)) needRow("Коэффициент", "Edm.Double");
-        if (lines.some((l) => l.content !== undefined)) needRow("Содержание", "Edm.String");
-        if (lines.some((l) => l.warehouseEmpty === true)) needRow("Склад_Key", "Edm.Guid");
+        if (goodsLines.some((l) => l.sourceLineId !== undefined))
+          needRow("ИдентификаторСтроки", "Edm.String");
+        if (goodsLines.some((l) => l.unitRef !== undefined)) needRow("ЕдиницаИзмерения_Key", "Edm.Guid");
+        if (goodsLines.some((l) => l.coefficient !== undefined)) needRow("Коэффициент", "Edm.Double");
+        if (goodsLines.some((l) => l.content !== undefined)) needRow("Содержание", "Edm.String");
+        if (goodsLines.some((l) => l.warehouseEmpty === true)) needRow("Склад_Key", "Edm.Guid");
+        if (serviceLines) {
+          const serviceProps = new Map(
+            (await conn.getMetadata()).entities
+              .get(`${set}_Услуги`)
+              ?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          for (const [field, type] of [
+            ["Номенклатура_Key", "Edm.Guid"],
+            ["Количество", "Edm.Double"],
+            ["Цена", "Edm.Double"],
+            ["Сумма", "Edm.Double"],
+            ["СтавкаНДС", "Edm.String"],
+            ["СуммаНДС", "Edm.Double"],
+            ["СчетЗатрат_Key", "Edm.Guid"],
+            ["СчетЗатратНУ_Key", "Edm.Guid"],
+            ["СчетУчетаНДС_Key", "Edm.Guid"],
+          ] as const)
+            if (serviceProps.get(field) !== type)
+              throw new InputError(`Схема услуги поступления не публикует ${field} с типом ${type}.`);
+          if (
+            serviceLines.some((l) => l.sourceLineId !== undefined) &&
+            serviceProps.get("ИдентификаторСтроки") !== "Edm.String"
+          )
+            throw new InputError("Схема услуги поступления не публикует ИдентификаторСтроки.");
+          if (serviceLines.some((l) => l.content !== undefined)) {
+            if (serviceProps.get("Содержание") !== "Edm.String")
+              throw new InputError("Схема услуги поступления не публикует Содержание.");
+          }
+          const usedAnalytics = serviceLines.flatMap((l) => [
+            ...(l.analytics ?? []),
+            ...(l.analyticsNu ?? []),
+          ]);
+          if (usedAnalytics.length) {
+            const available = await conn.available();
+            for (let index = 1; index <= 3; index++) {
+              if (serviceLines.some((l) => (l.analytics?.length ?? 0) >= index)) {
+                if (
+                  serviceProps.get(`Субконто${index}`) !== "Edm.String" ||
+                  serviceProps.get(`Субконто${index}_Type`) !== "Edm.String"
+                )
+                  throw new InputError(`Схема услуги поступления не публикует Субконто${index} и его тип.`);
+              }
+              if (serviceLines.some((l) => (l.analyticsNu?.length ?? 0) >= index)) {
+                if (
+                  serviceProps.get(`СубконтоНУ${index}`) !== "Edm.String" ||
+                  serviceProps.get(`СубконтоНУ${index}_Type`) !== "Edm.String"
+                )
+                  throw new InputError(`Схема услуги поступления не публикует СубконтоНУ${index} и его тип.`);
+              }
+            }
+            for (const item of usedAnalytics) {
+              const typeSet = item.type.replace(/^StandardODATA\./, "");
+              if (!available.has(typeSet))
+                throw new InputError(`Тип аналитики ${item.type} не опубликован в OData.`);
+              const found = await conn.client.getEntity(
+                `${typeSet}(${odataGuid(item.ref)})?$format=json&$select=Ref_Key,DeletionMark`,
+              );
+              if (
+                String(found["Ref_Key"] ?? "")
+                  .replace(/[{}]/g, "")
+                  .toLowerCase() !== item.ref.toLowerCase()
+              )
+                throw new InputError(`Ссылка аналитики ${item.ref} (${item.type}) не найдена.`);
+              if (found["DeletionMark"] === true)
+                throw new InputError(`Ссылка аналитики ${item.ref} помечена на удаление.`);
+            }
+          }
+          const serviceRefs = serviceLines.flatMap((l) => [
+            l.costAccountRef,
+            l.costAccountNuRef,
+            l.vatAccountRef,
+          ]);
+          if (serviceRefs.some((r) => r !== undefined))
+            await accountsByRef(conn, [...new Set(serviceRefs.filter((r): r is string => Boolean(r)))]);
+        }
         const refs = [
           settlementAccountRef,
           advanceAccountRef,
-          ...lines.flatMap((l) => [l.inventoryAccountRef, l.vatAccountRef]),
+          ...goodsLines.flatMap((l) => [l.inventoryAccountRef, l.vatAccountRef]),
         ].filter((r): r is string => Boolean(r));
         if (refs.length) await accountsByRef(conn, [...new Set(refs)]);
-        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "purchase");
-        const rows = lines.map((l, i) => {
+        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, goodsLines, "purchase");
+        const rows = goodsLines.map((l, i) => {
           const defaults = lineAccountsFor(l);
           return clean({
             ...(l.sourceLineId !== undefined ? { ИдентификаторСтроки: l.sourceLineId } : {}),
@@ -3306,14 +3458,45 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             СчетУчетаНДС_Key: l.vatAccountRef ?? defaults["СчетУчетаНДС_Key"],
             ...(l.unitRef !== undefined ? { ЕдиницаИзмерения_Key: l.unitRef } : {}),
             ...(l.coefficient !== undefined ? { Коэффициент: l.coefficient } : {}),
+            ...(l.countryOfOriginRef !== undefined ? { СтранаПроисхождения_Key: l.countryOfOriginRef } : {}),
             // Пустой склад строки — явный нулевой GUID, чтобы сервер не подставил склад шапки.
             ...(l.warehouseEmpty ? { Склад_Key: EMPTY_GUID } : {}),
           });
         });
+        const emptyServiceQuantity = (serviceLines ?? []).some((l) => l.emptyQuantity === true);
+        const serviceRows = (serviceLines ?? []).map((l, i) => {
+          const analytics = (
+            items: typeof l.analytics | undefined,
+            prefix: string,
+          ): Record<string, unknown> =>
+            Object.fromEntries(
+              (items ?? []).flatMap((item, index) => [
+                [`${prefix}${index + 1}`, item.ref],
+                [`${prefix}${index + 1}_Type`, item.type],
+              ]),
+            );
+          return clean({
+            ...(l.sourceLineId !== undefined ? { ИдентификаторСтроки: l.sourceLineId } : {}),
+            ...analytics(l.analytics, "Субконто"),
+            ...analytics(l.analyticsNu, "СубконтоНУ"),
+            LineNumber: i + 1,
+            Номенклатура_Key: l.nomenclatureRef,
+            ...(l.content === undefined ? {} : { Содержание: l.content }),
+            ...(l.emptyQuantity ? {} : { Количество: l.quantity }),
+            Цена: l.price,
+            Сумма: l.amount ?? (l.emptyQuantity ? undefined : lineSum(l as GoodsLine)),
+            СтавкаНДС: l.vatRate,
+            ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
+            ...(l.costAccountRef !== undefined ? { СчетЗатрат_Key: l.costAccountRef } : {}),
+            ...(l.costAccountNuRef !== undefined ? { СчетЗатратНУ_Key: l.costAccountNuRef } : {}),
+            ...(l.vatAccountRef !== undefined ? { СчетУчетаНДС_Key: l.vatAccountRef } : {}),
+          });
+        });
+        const allRows = [...rows, ...serviceRows];
         const netTotal =
-          Math.round(rows.reduce((sum, row) => sum + Number(row["Сумма"] ?? 0), 0) * 100) / 100;
+          Math.round(allRows.reduce((sum, row) => sum + Number(row["Сумма"] ?? 0), 0) * 100) / 100;
         const vatTotal =
-          Math.round(rows.reduce((sum, row) => sum + Number(row["СуммаНДС"] ?? 0), 0) * 100) / 100;
+          Math.round(allRows.reduce((sum, row) => sum + Number(row["СуммаНДС"] ?? 0), 0) * 100) / 100;
         const total =
           documentTotal ?? (sumIncludesVat ? netTotal : Math.round((netTotal + vatTotal) * 100) / 100);
         const now = new Date();
@@ -3373,7 +3556,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const payload = clean({
           Date: odataDate(documentDate),
           Number: number.trim(),
-          ВидОперации: "Товары",
+          ВидОперации: resolvedOperationKind,
           Posted: false,
           Организация_Key: org.key,
           Склад_Key: warehouseKey,
@@ -3389,7 +3572,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
           СуммаВключаетНДС: sumIncludesVat,
           СуммаДокумента: total,
-          Товары: rows,
+          ...(goodsLines.length ? { Товары: rows } : {}),
+          ...(serviceLines ? { Услуги: serviceRows } : {}),
         });
         let effectivePayload = payload;
         const created = await createOrPreview(conn, set, payload, confirm, undefined, {
@@ -3397,7 +3581,19 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             effectivePayload = prepared;
           },
         });
-        if (!confirm || created.isError) return created;
+        if (!confirm || created.isError) {
+          if (!confirm && historical)
+            return withStructured(created, {
+              ...(emptyServiceQuantity
+                ? {
+                    quantityVerification: "pending_live_validation",
+                    quantityNote:
+                      "Количество услуги не отправлено; представление пустого числа в 1С проверяется после записи.",
+                  }
+                : {}),
+            });
+          return created;
+        }
         const createdData = created.structuredContent as Record<string, unknown> | undefined;
         const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
         if (!ref) return created;
@@ -3421,7 +3617,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const expectedHeader: Record<string, unknown> = {
           Date: effectivePayload["Date"],
           Number: effectivePayload["Number"],
-          ВидОперации: "Товары",
+          ВидОперации: resolvedOperationKind,
           Posted: false,
           DeletionMark: false,
           Организация_Key: org.key,
@@ -3445,7 +3641,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           if (!sameStoredValue(value, actual[field], types.get(field) ?? "Edm.String"))
             mismatches.push({ field, expected: value, actual: actual[field] });
         const actualRows = actual["Товары"];
-        if (!Array.isArray(actualRows) || actualRows.length !== rows.length)
+        if (goodsLines.length === 0) {
+          // Сервисный документ: таблицы «Товары» нет.
+        } else if (!Array.isArray(actualRows) || actualRows.length !== rows.length)
           mismatches.push({
             field: "Товары",
             expected: `строк: ${rows.length}`,
@@ -3477,6 +3675,42 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               });
           });
         }
+        if (serviceLines) {
+          const actualServices = actual["Услуги"];
+          if (!Array.isArray(actualServices) || actualServices.length !== serviceRows.length)
+            mismatches.push({
+              field: "Услуги",
+              expected: `строк: ${serviceRows.length}`,
+              actual: Array.isArray(actualServices) ? `строк: ${actualServices.length}` : "нет таблицы",
+            });
+          else {
+            const typesService = new Map(
+              (await conn.getMetadata()).entities
+                .get(`${set}_Услуги`)
+                ?.properties.map((p) => [p.name, p.type]) ?? [],
+            );
+            serviceRows.forEach((expected, index) => {
+              const actualRow = actualServices[index] as Record<string, unknown>;
+              for (const [field, value] of Object.entries(expected))
+                if (!sameStoredValue(value, actualRow[field], typesService.get(field) ?? "Edm.String"))
+                  mismatches.push({
+                    field: `Услуги[${index + 1}].${field}`,
+                    expected: value,
+                    actual: actualRow[field],
+                  });
+              if (serviceLines?.[index]?.emptyQuantity) {
+                const stored = actualRow["Количество"];
+                const empty = stored == null || stored === "" || Number(stored) === 0;
+                if (!empty)
+                  mismatches.push({
+                    field: `Услуги[${index + 1}].Количество`,
+                    expected: "пусто/0",
+                    actual: stored,
+                  });
+              }
+            });
+          }
+        }
         if (mismatches.length)
           return {
             ...created,
@@ -3492,9 +3726,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           };
         return withStructured(created, {
           verification: "ok",
+          ...(emptyServiceQuantity ? { quantityVerification: "pending_live_validation" } : {}),
           verifiedFields: [
             ...Object.keys(expectedHeader),
             ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Товары[${i + 1}].${field}`)),
+            ...serviceRows.flatMap((row, i) => Object.keys(row).map((field) => `Услуги[${i + 1}].${field}`)),
           ],
         });
       }),

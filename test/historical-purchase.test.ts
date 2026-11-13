@@ -11,6 +11,7 @@ const WH = "44444444-4444-4444-8444-444444444444";
 const NOM = "55555555-5555-4555-8555-555555555555";
 const ACC = "11111111-1111-4111-8111-111111111111";
 const UNIT = "66666666-6666-4666-8666-666666666666";
+const COUNTRY = "77777777-7777-4777-8777-777777777777";
 const DOC = "99999999-9999-4999-8999-999999999999";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -25,6 +26,7 @@ async function setup(
     rowWarehouse?: string;
     rowUnit?: string;
     rowCoefficient?: number;
+    serviceQuantity?: number;
     contractKind?: string;
   } = {},
 ) {
@@ -49,7 +51,18 @@ async function setup(
         ...(options.rowUnit !== undefined ? { ЕдиницаИзмерения_Key: options.rowUnit } : {}),
         ...(options.rowCoefficient !== undefined ? { Коэффициент: options.rowCoefficient } : {}),
       }));
-      return { DeletionMark: false, ...actual, Товары: rows };
+      const services = Array.isArray(actual["Услуги"])
+        ? (actual["Услуги"] as Array<Record<string, unknown>>).map((row) => ({
+            ...row,
+            ...(options.serviceQuantity !== undefined ? { Количество: options.serviceQuantity } : {}),
+          }))
+        : actual["Услуги"];
+      return {
+        DeletionMark: false,
+        ...actual,
+        Товары: rows,
+        ...(services !== undefined ? { Услуги: services } : {}),
+      };
     }
     return original(path);
   });
@@ -102,6 +115,7 @@ const args = {
       vatAccountRef: ACC,
       unitRef: UNIT,
       coefficient: 1,
+      countryOfOriginRef: COUNTRY,
       warehouseEmpty: true,
     },
   ],
@@ -138,9 +152,254 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
       СчетУчетаНДС_Key: ACC,
       ЕдиницаИзмерения_Key: UNIT,
       Коэффициент: 1,
+      СтранаПроисхождения_Key: COUNTRY,
       Склад_Key: "00000000-0000-0000-0000-000000000000",
     });
     expect(postCount(fake)).toBe(0);
+  });
+
+  it("для Товары+Услуги требует явный operationKind и проверяет совместимость", async () => {
+    const { client, fake } = await setup();
+    const mixedBase = {
+      ...args,
+      sumIncludesVat: true,
+      documentTotal: 300,
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          quantity: 1,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+        },
+      ],
+    };
+    const missing = await call(client, { ...mixedBase, confirm: false });
+    expect(missing.isError).toBe(true);
+    expect(JSON.stringify(missing)).toContain("operationKind");
+    expect(postCount(fake)).toBe(0);
+
+    const wrong = await call(client, { ...mixedBase, operationKind: "Товары", confirm: false });
+    expect(wrong.isError).toBe(true);
+    expect(JSON.stringify(wrong)).toContain("ПокупкаКомиссия");
+  });
+
+  it("смешанный документ: товарная и сервисная строки в отдельных таблицах", async () => {
+    const { client } = await setup();
+    const mixed = {
+      ...args,
+      operationKind: "ПокупкаКомиссия",
+      sumIncludesVat: true,
+      documentTotal: 300,
+      lines: [
+        {
+          ...args.lines[0],
+          quantity: 1.5,
+          amount: 150,
+          vatAmount: 30,
+        },
+      ],
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          quantity: 2,
+          price: 50,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          content: "Услуга по договору",
+          sourceLineId: "SRC-S-1",
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+          analytics: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
+          analyticsNu: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
+        },
+      ],
+    };
+    const preview = await call(client, { ...mixed, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      ВидОперации: "ПокупкаКомиссия",
+      СуммаВключаетНДС: true,
+      СуммаДокумента: 300,
+    });
+    expect((payload["Товары"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      Количество: 1.5,
+      ЕдиницаИзмерения_Key: UNIT,
+      Коэффициент: 1,
+      СтранаПроисхождения_Key: COUNTRY,
+      Склад_Key: "00000000-0000-0000-0000-000000000000",
+    });
+    expect((payload["Услуги"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      Количество: 2,
+      Сумма: 100,
+      СуммаНДС: 20,
+      СчетЗатрат_Key: ACC,
+      СчетЗатратНУ_Key: ACC,
+      СчетУчетаНДС_Key: ACC,
+      ИдентификаторСтроки: "SRC-S-1",
+      Субконто1: NOM,
+      Субконто1_Type: "StandardODATA.Catalog_Номенклатура",
+      СубконтоНУ1: NOM,
+      СубконтоНУ1_Type: "StandardODATA.Catalog_Номенклатура",
+    });
+    const operationId = preview.structuredContent?.operationId;
+    const created = await call(client, { ...mixed, confirm: true, operationId });
+    expect(created.isError, JSON.stringify(created)).toBeFalsy();
+    expect(created.structuredContent?.verifiedFields).toEqual(
+      expect.arrayContaining([
+        "Товары[1].Склад_Key",
+        "Услуги[1].СчетЗатрат_Key",
+        "Услуги[1].СчетЗатратНУ_Key",
+        "Услуги[1].Субконто1_Type",
+        "Услуги[1].СубконтоНУ1_Type",
+      ]),
+    );
+  });
+
+  it("вид «Услуги» без таблицы «Товары» и с пустым складом шапки", async () => {
+    const { client } = await setup();
+    const serviceOnly = {
+      ...args,
+      lines: undefined,
+      warehouse: undefined,
+      sumIncludesVat: true,
+      documentTotal: 120,
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          quantity: 1,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          content: "Услуга",
+          sourceLineId: "SRC-SVC",
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+          analytics: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
+          analyticsNu: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
+        },
+      ],
+    };
+    const preview = await call(client, { ...serviceOnly, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      ВидОперации: "Услуги",
+      Склад_Key: "00000000-0000-0000-0000-000000000000",
+      СуммаДокумента: 120,
+    });
+    expect(payload).not.toHaveProperty("Товары");
+    expect((payload["Услуги"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      Сумма: 100,
+      СуммаНДС: 20,
+      ИдентификаторСтроки: "SRC-SVC",
+    });
+    const operationId = preview.structuredContent?.operationId;
+    const created = await call(client, { ...serviceOnly, confirm: true, operationId });
+    expect(created.isError, JSON.stringify(created)).toBeFalsy();
+  });
+
+  it("emptyQuantity услуги: без подстановки 1, с явными суммой и НДС", async () => {
+    const { client, fake } = await setup();
+    const emptyService = {
+      ...args,
+      lines: undefined,
+      warehouse: undefined,
+      sumIncludesVat: true,
+      documentTotal: 120,
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          emptyQuantity: true,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          content: "Услуга без количества",
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+        },
+      ],
+    };
+    const preview = await call(client, { ...emptyService, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const row = (preview.structuredContent?.payload as Record<string, unknown>)["Услуги"] as Array<
+      Record<string, unknown>
+    >;
+    expect(row[0]).not.toHaveProperty("Количество");
+    expect(row[0]).toMatchObject({ Сумма: 100, СуммаНДС: 20 });
+    expect(preview.structuredContent?.quantityVerification).toBe("pending_live_validation");
+    const operationId = preview.structuredContent?.operationId;
+    const created = await call(client, { ...emptyService, confirm: true, operationId });
+    expect(created.isError, JSON.stringify(created)).toBeFalsy();
+    expect(created.structuredContent).toMatchObject({
+      verification: "ok",
+      quantityVerification: "pending_live_validation",
+    });
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("emptyQuantity услуги требует amount/vatAmount и не сочетается с quantity", async () => {
+    const { client, fake } = await setup();
+    const missing = await call(client, {
+      ...args,
+      lines: undefined,
+      serviceLines: [{ nomenclatureRef: NOM, emptyQuantity: true, price: 100 }],
+      confirm: false,
+    });
+    expect(missing.isError).toBe(true);
+    const both = await call(client, {
+      ...args,
+      lines: undefined,
+      serviceLines: [
+        { nomenclatureRef: NOM, quantity: 1, emptyQuantity: true, price: 100, amount: 100, vatAmount: 20 },
+      ],
+      confirm: false,
+    });
+    expect(both.isError).toBe(true);
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("непустое количество после записи пустой услуги ломает verification", async () => {
+    const { client } = await setup({ serviceQuantity: 1 });
+    const emptyService = {
+      ...args,
+      lines: undefined,
+      warehouse: undefined,
+      sumIncludesVat: true,
+      documentTotal: 120,
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          emptyQuantity: true,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+        },
+      ],
+    };
+    const preview = await call(client, { ...emptyService, confirm: false });
+    const created = await call(client, {
+      ...emptyService,
+      confirm: true,
+      operationId: preview.structuredContent?.operationId,
+    });
+    expect(created.isError, JSON.stringify(created)).toBe(true);
+    expect(JSON.stringify(created)).toContain("Количество");
   });
 
   it("подтверждает и полностью проверяет readback", async () => {

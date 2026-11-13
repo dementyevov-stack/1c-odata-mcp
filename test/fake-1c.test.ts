@@ -144,7 +144,7 @@ const OVERRIDES: Record<string, Record<string, unknown>> = {
 /** Значение аргумента по имени и схеме поля. */
 function valueFor(name: string, s: Schema): unknown {
   if (s.enum?.length) return s.enum[0];
-  if (name === "lines") return [line];
+  if (name === "lines" || name === "serviceLines") return [line];
   if (name === "line") return line;
   if (/Ref$|^ref$/.test(name)) return id;
   if (name === "month") return "2026-09";

@@ -7521,12 +7521,21 @@
             "description": "ЭтоУниверсальныйДокумент",
             "type": "boolean"
           },
+          "operationKind": {
+            "description": "Исторический ВидОперации; для Товары+Услуги обязателен явный выбор",
+            "type": "string",
+            "enum": [
+              "Товары",
+              "Услуги",
+              "ПокупкаКомиссия"
+            ]
+          },
           "allowGenericContractKind": {
             "description": "Явное бизнес-основание принять договор вида «Прочее»",
             "type": "boolean"
           },
           "lines": {
-            "minItems": 1,
+            "description": "Товарные позиции документа",
             "type": "array",
             "items": {
               "type": "object",
@@ -7609,6 +7618,12 @@
                   "type": "number",
                   "exclusiveMinimum": 0
                 },
+                "countryOfOriginRef": {
+                  "description": "Ref_Key страны происхождения товара",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
                 "warehouseEmpty": {
                   "description": "Opt-in: склад строки пустой (склад только в шапке)",
                   "type": "boolean"
@@ -7619,8 +7634,150 @@
                 "quantity",
                 "price"
               ]
-            },
-            "description": "Позиции документа"
+            }
+          },
+          "serviceLines": {
+            "description": "Сервисные позиции в отдельной таблице «Услуги»",
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "nomenclatureRef": {
+                  "type": "string",
+                  "description": "Ref_Key номенклатуры"
+                },
+                "quantity": {
+                  "description": "Количество; при emptyQuantity не задаётся",
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "price": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Цена за единицу"
+                },
+                "vatRate": {
+                  "default": "БезНДС",
+                  "description": "Ставка НДС, включая исторические",
+                  "type": "string",
+                  "enum": [
+                    "БезНДС",
+                    "НДС0",
+                    "НДС5",
+                    "НДС5_105",
+                    "НДС7",
+                    "НДС7_107",
+                    "НДС10",
+                    "НДС10_110",
+                    "НДС18",
+                    "НДС18_118",
+                    "НДС20",
+                    "НДС20_120",
+                    "НДС22",
+                    "НДС22_122"
+                  ]
+                },
+                "content": {
+                  "description": "Содержание строки (реквизит «Содержание») — именно этот текст печатается в счёте и УПД. Для услуг заполняйте обязательно, напр. «Услуги согласно приложению № 4 от 01.10.2025 г. к договору № 87 от 01.12.2023 г. за июль 2026 г.». 1С сама это поле НЕ заполняет.",
+                  "type": "string"
+                },
+                "emptyQuantity": {
+                  "description": "Opt-in: количество в источнике пустое",
+                  "type": "boolean"
+                },
+                "amount": {
+                  "description": "Явная сумма строки",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "vatAmount": {
+                  "description": "Явная сумма НДС строки",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "sourceLineId": {
+                  "description": "ИдентификаторСтроки источника",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "costAccountRef": {
+                  "description": "Ref_Key счёта затрат БУ",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "costAccountNuRef": {
+                  "description": "Ref_Key счёта затрат НУ",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "vatAccountRef": {
+                  "description": "Ref_Key счёта входящего НДС",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "analytics": {
+                  "description": "Субконто БУ1..3",
+                  "maxItems": 3,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "ref": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "description": "Ref_Key аналитики"
+                      },
+                      "type": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": "Тип ссылки, напр. StandardODATA.Catalog_Контрагенты"
+                      }
+                    },
+                    "required": [
+                      "ref",
+                      "type"
+                    ]
+                  }
+                },
+                "analyticsNu": {
+                  "description": "СубконтоНУ1..3",
+                  "maxItems": 3,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "ref": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "description": "Ref_Key аналитики"
+                      },
+                      "type": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": "Тип ссылки, напр. StandardODATA.Catalog_Контрагенты"
+                      }
+                    },
+                    "required": [
+                      "ref",
+                      "type"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "nomenclatureRef",
+                "price"
+              ]
+            }
           },
           "confirm": {
             "default": false,
@@ -7635,8 +7792,7 @@
           }
         },
         "required": [
-          "counterpartyRef",
-          "lines"
+          "counterpartyRef"
         ],
         "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
