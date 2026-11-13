@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto";
-import { open, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
+import { InputError } from "../errors.js";
 import type { SourceDocument, TargetRequisites } from "./types.js";
 
 /**
- * Локальный журнал загрузчика: sourceKey → operationId/Ref_Key и состояние. Полных реквизитов
- * выписки и сумм здесь нет — только отпечаток, ссылка и статус, чтобы журнал можно было хранить
- * рядом с базой и не тащить в Git бухгалтерские данные.
+ * Локальный журнал загрузчика: sourceKey → operationId/Ref_Key, состояние и значимые поля
+ * проверенного плана. Полных реквизитов источника и ИНН здесь нет; журнал хранится локально
+ * и не коммитится.
  */
 
 export type BankLoadState = "prepared" | "submitted" | "created" | "unknown" | "rejected";
@@ -51,11 +53,89 @@ export interface JournalSummary {
 }
 
 const EMPTY: JournalFile = { version: 1, entries: {} };
+const LOCK_STALE_MS = 24 * 60 * 60 * 1_000;
+const LOCK_MALFORMED_STALE_MS = 5 * 60 * 1_000;
 
 export class BankLoadJournal {
   private readonly file: string;
+  private readonly lockFile: string;
+  private lockHeld = false;
   constructor(readonly directory: string) {
     this.file = join(directory, "source-journal.json");
+    this.lockFile = join(directory, "journal.lock");
+  }
+
+  /**
+   * Один писатель на каталог журнала. Lock-файл с pid/host/временем; второй процесс получает
+   * отказ, а lock от погибшего процесса снимается по несуществующему pid или возрасту.
+   */
+  async acquire(): Promise<void> {
+    if (this.lockHeld) return;
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const handle = await open(this.lockFile, "wx", 0o600);
+        try {
+          await handle.writeFile(
+            JSON.stringify({ pid: process.pid, host: hostname(), startedAt: new Date().toISOString() }),
+            "utf8",
+          );
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        this.lockHeld = true;
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (!(await this.lockIsStale())) {
+          const owner = await this.lockOwner();
+          throw new InputError(
+            `Журнал ${this.directory} уже используется${owner ? ` (pid ${owner.pid})` : ""}. ` +
+              "Дождитесь завершения другого загрузчика или, если он точно остановлен, удалите journal.lock.",
+          );
+        }
+        await rm(this.lockFile, { force: true }).catch(() => undefined);
+      }
+    }
+    throw new InputError(
+      `Не удалось захватить журнал ${this.directory}: lock-файл постоянно перехватывается другим процессом.`,
+    );
+  }
+
+  async release(): Promise<void> {
+    if (!this.lockHeld) return;
+    this.lockHeld = false;
+    await rm(this.lockFile, { force: true }).catch(() => undefined);
+  }
+
+  private async lockOwner(): Promise<{ pid?: number } | undefined> {
+    try {
+      return JSON.parse(await readFile(this.lockFile, "utf8")) as { pid?: number };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async lockIsStale(): Promise<boolean> {
+    let info: { pid?: number; host?: string; startedAt?: string };
+    try {
+      info = JSON.parse(await readFile(this.lockFile, "utf8")) as typeof info;
+    } catch {
+      // Пустой/недописанный lock: только что созданный другим процессом считаем живым.
+      const fileStat = await stat(this.lockFile).catch(() => undefined);
+      return !fileStat || Date.now() - fileStat.mtimeMs > LOCK_MALFORMED_STALE_MS;
+    }
+    const age = info.startedAt ? Date.now() - Date.parse(info.startedAt) : Number.NaN;
+    if (Number.isFinite(age) && age > LOCK_STALE_MS) return true;
+    if (typeof info.pid !== "number" || info.pid <= 0) return true;
+    if (info.host && info.host !== hostname()) return false;
+    try {
+      process.kill(info.pid, 0);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ESRCH";
+    }
   }
 
   async read(): Promise<JournalFile> {
@@ -83,9 +163,15 @@ export class BankLoadJournal {
   }
 
   async put(entry: BankLoadEntry): Promise<void> {
-    const file = await this.read();
-    file.entries[entry.sourceKey] = entry;
-    await this.write(file);
+    const owned = !this.lockHeld;
+    if (owned) await this.acquire();
+    try {
+      const file = await this.read();
+      file.entries[entry.sourceKey] = entry;
+      await this.write(file);
+    } finally {
+      if (owned) await this.release();
+    }
   }
 
   async summary(): Promise<JournalSummary> {

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -500,24 +500,85 @@ describe("подготовка оплаты покупателя", () => {
     expect(postCount(fake)).toBe(1);
   });
 
-  it("журнал предыдущей версии не считается изменённым источником", async () => {
+  it.each([
+    ["number", "HIST-1"],
+    ["time", "09:10:11"],
+    ["cashFlowItemRef", DDS],
+    ["customerInvoiceRef", INV],
+  ])("добавление исторического поля %s к уже загруженному ключу — конфликт", async (field, value) => {
+    const legacySource = {
+      ...source,
+      number: undefined,
+      time: undefined,
+      cashFlowItemRef: undefined,
+      customerInvoiceRef: undefined,
+    };
     const { client, fake, journal } = await fixture();
-    const first = await prepareAndConfirm(client, target, source, journal);
+    const first = await prepareAndConfirm(client, target, legacySource, journal);
     expect(first.documents[0]?.action).toBe("created");
     const entry = (await journal.get(source.sourceKey))!;
-    await journal.put({ ...entry, sourceHash: legacySourceHash(source, target) });
-    const again = await runPackage(client, target, [source], journal, { confirm: true });
+    await journal.put({ ...entry, sourceHash: legacySourceHash(legacySource, target) });
+    const changed = { ...legacySource, [field]: value } as SourceDocument;
+    const again = await runPackage(client, target, [changed], journal, { confirm: true });
+    expect(again.documents[0]?.action).toBe("blocked");
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("второй пакет с тем же журналом получает отказ, а не теряет строки", async () => {
+    const { client, fake, journal } = await fixture();
+    const second = new BankLoadJournal(journal.directory);
+    await journal.acquire();
+    await expect(
+      runPackage(client, target, [{ ...source, sourceKey: "second-package" }], second, { confirm: false }),
+    ).rejects.toThrow("уже используется");
+    expect(postCount(fake)).toBe(0);
+    await journal.release();
+  });
+
+  it("lock погибшего процесса снимается после прерывания", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bank-loader-stale-"));
+    cleanup.push(() => rm(dir, { recursive: true, force: true }));
+    await writeFile(
+      join(dir, "journal.lock"),
+      JSON.stringify({ pid: 9999999, host: "other-host", startedAt: new Date(0).toISOString() }),
+    );
+    const journal = new BankLoadJournal(dir);
+    await journal.acquire();
+    await journal.release();
+  });
+
+  it("журнал предыдущей версии не считается изменённым источником", async () => {
+    const legacySource = {
+      ...source,
+      number: undefined,
+      time: undefined,
+      cashFlowItemRef: undefined,
+      customerInvoiceRef: undefined,
+    };
+    const { client, fake, journal } = await fixture();
+    const first = await prepareAndConfirm(client, target, legacySource, journal);
+    expect(first.documents[0]?.action).toBe("created");
+    const entry = (await journal.get(source.sourceKey))!;
+    await journal.put({ ...entry, sourceHash: legacySourceHash(legacySource, target) });
+    const again = await runPackage(client, target, [legacySource], journal, { confirm: true });
     expect(again.documents[0]?.action).toBe("already_loaded");
     expect(postCount(fake)).toBe(1);
   });
 
   it("журнал предыдущей версии с неизвестным POST всё равно сверяется", async () => {
+    const legacySource = {
+      ...source,
+      number: undefined,
+      time: undefined,
+      cashFlowItemRef: undefined,
+      customerInvoiceRef: undefined,
+    };
     const { client, fake, journal } = await fixture({ dropPostResponse: true });
-    const first = await prepareAndConfirm(client, target, source, journal);
+    const first = await prepareAndConfirm(client, target, legacySource, journal);
     expect(first.documents[0]?.action).toBe("unknown");
     const entry = (await journal.get(source.sourceKey))!;
-    await journal.put({ ...entry, sourceHash: legacySourceHash(source, target) });
-    const resumed = await runPackage(client, target, [source], journal, {
+    await journal.put({ ...entry, sourceHash: legacySourceHash(legacySource, target) });
+    const resumed = await runPackage(client, target, [legacySource], journal, {
       confirm: true,
       mode: "resume",
     });

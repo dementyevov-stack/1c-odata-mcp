@@ -626,9 +626,15 @@ async function runOne(
   options: { confirm: boolean; mode: RunMode; database?: string },
 ): Promise<DocumentReport> {
   const sourceHash = hashSource(source, target);
-  const legacyHash = legacySourceHash(source, target);
+  const hasNewSourceFields = Boolean(
+    source.number || source.time || source.cashFlowItemRef || source.customerInvoiceRef,
+  );
+  // Старый отпечаток эквивалентен только пока в источнике нет полей, которых он не знает:
+  // иначе добавление номера/времени/ДДС/счёта покупателя должно стать конфликтом, а не already_loaded.
+  const legacyHash = hasNewSourceFields ? undefined : legacySourceHash(source, target);
   const existing = await journal.get(source.sourceKey);
-  const hashMatches = existing?.sourceHash === sourceHash || existing?.sourceHash === legacyHash;
+  const hashMatches =
+    existing?.sourceHash === sourceHash || (legacyHash !== undefined && existing?.sourceHash === legacyHash);
   const changed = existing !== undefined && !hashMatches;
   const mode = options.mode;
 
@@ -797,7 +803,8 @@ async function runOne(
 
   const reuse =
     preparedState?.state === "prepared" &&
-    (preparedState.sourceHash === sourceHash || preparedState.sourceHash === legacyHash) &&
+    (preparedState.sourceHash === sourceHash ||
+      (legacyHash !== undefined && preparedState.sourceHash === legacyHash)) &&
     preparedState.operationId !== undefined;
   const attempt = reuse && preparedState ? preparedState.attempt : (existing?.attempt ?? 0) + 1;
   const operationId =
@@ -1011,38 +1018,43 @@ export async function runPackage(
   options: { confirm: boolean; database?: string; mode?: RunMode },
 ): Promise<RunReport> {
   const mode = options.mode ?? (options.confirm ? "confirm" : "prepare");
-  const documents: DocumentReport[] = [];
-  for (const source of sources) {
-    try {
-      documents.push(await runOne(client, target, source, journal, { ...options, mode }));
-    } catch (error) {
-      documents.push({
-        sourceKey: source.sourceKey,
-        action: "failed",
-        note: bounded(error instanceof Error ? error.message : String(error)),
-      });
+  await journal.acquire();
+  try {
+    const documents: DocumentReport[] = [];
+    for (const source of sources) {
+      try {
+        documents.push(await runOne(client, target, source, journal, { ...options, mode }));
+      } catch (error) {
+        documents.push({
+          sourceKey: source.sourceKey,
+          action: "failed",
+          note: bounded(error instanceof Error ? error.message : String(error)),
+        });
+      }
     }
+    const count = (action: DocumentAction): number => documents.filter((d) => d.action === action).length;
+    return {
+      mode: mode === "resume" ? "resume" : options.confirm ? "confirm" : "dry-run",
+      ...(options.database ? { database: options.database } : {}),
+      summary: {
+        total: documents.length,
+        dryRun: count("dry_run"),
+        created: count("created"),
+        alreadyLoaded: count("already_loaded"),
+        reconciled: count("reconciled"),
+        rejected: count("rejected"),
+        unknown: count("unknown"),
+        blocked: count("blocked"),
+        failed: count("failed"),
+        skipped: count("skipped"),
+        prepared: count("prepared"),
+        verificationFailed: documents.filter((d) => d.verification === "failed").length,
+      },
+      documents,
+    };
+  } finally {
+    await journal.release();
   }
-  const count = (action: DocumentAction): number => documents.filter((d) => d.action === action).length;
-  return {
-    mode: mode === "resume" ? "resume" : options.confirm ? "confirm" : "dry-run",
-    ...(options.database ? { database: options.database } : {}),
-    summary: {
-      total: documents.length,
-      dryRun: count("dry_run"),
-      created: count("created"),
-      alreadyLoaded: count("already_loaded"),
-      reconciled: count("reconciled"),
-      rejected: count("rejected"),
-      unknown: count("unknown"),
-      blocked: count("blocked"),
-      failed: count("failed"),
-      skipped: count("skipped"),
-      prepared: count("prepared"),
-      verificationFailed: documents.filter((d) => d.verification === "failed").length,
-    },
-    documents,
-  };
 }
 
 /** Есть ли в отчёте что-то, что оператор должен разобрать до следующего запуска. */
