@@ -122,6 +122,14 @@ const VAT_RATES = ["БезНДС", "НДС0", "НДС5", "НДС7", "НДС10", 
  * Enum_СтавкиНДС БП 3.0, включая ставки до 2019 года и расчётные; неизвестное значение
  * отклоняется до записи, а не отправляется в 1С наугад.
  */
+/** Значения Enum_ОтражениеВУСН из проверенной схемы БП 3.0. */
+const INCOME_RECOGNITION_VALUES = [
+  "ВозвратРасхода",
+  "НеПринимаются",
+  "Принимаются",
+  "Распределяются",
+] as const;
+
 const BANK_VAT_RATES = [
   "БезНДС",
   "НДС0",
@@ -3720,7 +3728,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "по строке выписки: находит организацию по точным ИНН/КПП, её банковский счёт по номеру, " +
         "контрагента-покупателя по точным ИНН/КПП и договор по номеру (или единственный подходящий). " +
         "Явные поля источника переносятся по схеме: ставка и сумма НДС (включая исторические), " +
-        "назначение платежа, номер/дата входящего документа и счёт плательщика. Если поле не " +
+        "назначение платежа, номер/дата входящего документа, счёт плательщика, собственный номер/время, " +
+        "статья ДДС шапки и строки, счёт учёта банка, комментарий и ОтражениеВУСН. Если поле не " +
         "опубликовано или контрольное чтение после создания не совпало — отказ с диагностикой, " +
         "а не молчаливая потеря данных. Dry-run по умолчанию; для записи передайте operationId " +
         "из предпросмотра и confirm=true. Стабильный sourceKey делает повторный запуск безопасным.",
@@ -3789,7 +3798,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .string()
           .uuid()
           .optional()
-          .describe("Ref_Key статьи ДДС, если она задана явно; проверяется публикация и существование"),
+          .describe("Ref_Key статьи ДДС шапки, если она задана явно; проверяется публикация и существование"),
+        rowCashFlowItemRef: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("Ref_Key статьи ДДС в единственной строке расшифровки; отдельное поле схемы"),
         customerInvoiceRef: z
           .string()
           .uuid()
@@ -3797,6 +3811,19 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .describe(
             "Ref_Key счёта покупателю для строки расшифровки; проверяется публикация и существование",
           ),
+        bankLedgerAccountRef: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("Ref_Key счёта учёта банка (СчетБанк_Key); проверяется существование в плане счетов"),
+        comment: z.string().trim().max(500).optional().describe("Явный комментарий шапки документа"),
+        incomeRecognition: z
+          .string()
+          .trim()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("ОтражениеВУСН: ВозвратРасхода, НеПринимаются, Принимаются, Распределяются"),
         contractNumber: z.string().trim().min(1).max(100).optional().describe("Точный номер договора"),
         contractRef: z.string().uuid().optional().describe("Ref_Key договора, если он известен"),
         confirm: confirmField,
@@ -3823,7 +3850,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       vatRate,
       vatAmount,
       cashFlowItemRef,
+      rowCashFlowItemRef,
       customerInvoiceRef,
+      bankLedgerAccountRef,
+      comment,
+      incomeRecognition,
       contractNumber,
       contractRef,
       confirm,
@@ -3875,6 +3906,18 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         if (cashFlowItemRef !== undefined)
           need(headerProps, "СтатьяДвиженияДенежныхСредств_Key", "Edm.Guid", "документа");
         if (customerInvoiceRef !== undefined) need(rowProps, "СчетНаОплату_Key", "Edm.Guid", rowSet);
+        if (rowCashFlowItemRef !== undefined)
+          need(rowProps, "СтатьяДвиженияДенежныхСредств_Key", "Edm.Guid", rowSet);
+        if (bankLedgerAccountRef !== undefined) need(headerProps, "СчетБанк_Key", "Edm.Guid", "документа");
+        if (comment !== undefined) need(headerProps, "Комментарий", "Edm.String", "документа");
+        if (incomeRecognition !== undefined) {
+          need(headerProps, "ОтражениеВУСН", "Edm.String", "документа");
+          if (!(INCOME_RECOGNITION_VALUES as readonly string[]).includes(incomeRecognition))
+            throw new InputError(
+              `ОтражениеВУСН «${incomeRecognition}» не входит в проверенное перечисление. ` +
+                `Допустимые: ${INCOME_RECOGNITION_VALUES.join(", ")}.`,
+            );
+        }
 
         // НДС: явные ставка и сумма — только вместе; сумму не вычисляем из суммы платежа.
         if ((vatRate === undefined) !== (vatAmount === undefined))
@@ -3981,6 +4024,17 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         if (cashFlowItemRef) await existingTarget(CATALOGS.cashflowItems, cashFlowItemRef, "Статья ДДС");
         if (customerInvoiceRef)
           await existingTarget(WRITE_DOCUMENTS.customerInvoice, customerInvoiceRef, "Счёт покупателю");
+        if (rowCashFlowItemRef)
+          await existingTarget(CATALOGS.cashflowItems, rowCashFlowItemRef, "Статья ДДС строки");
+        if (bankLedgerAccountRef) {
+          try {
+            await accountsByRef(conn, [bankLedgerAccountRef]);
+          } catch {
+            throw new InputError(
+              `Счёт учёта банка ${bankLedgerAccountRef} не найден в плане счетов «Хозрасчётный».`,
+            );
+          }
+        }
         const bank = await resolveOrgBankAccountByNumber(conn, org.ref, orgBankAccountNumber);
         const counterparty = await resolveCounterpartyByRequisites(conn, {
           inn: payerInn,
@@ -4022,6 +4076,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(documentNumber !== undefined ? { НомерВходящегоДокумента: documentNumber } : {}),
           ...(incomingDate ? { ДатаВходящегоДокумента: incomingDate } : {}),
           ...(cashFlowItemRef ? { СтатьяДвиженияДенежныхСредств_Key: cashFlowItemRef } : {}),
+          ...(bankLedgerAccountRef ? { СчетБанк_Key: bankLedgerAccountRef } : {}),
+          ...(comment !== undefined ? { Комментарий: comment } : {}),
+          ...(incomeRecognition ? { ОтражениеВУСН: incomeRecognition } : {}),
           ...(payerBank ? { СчетКонтрагента_Key: payerBank.ref } : {}),
           СуммаДокумента: normalizedAmount,
           РасшифровкаПлатежа: [
@@ -4032,6 +4089,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               СуммаПлатежа: normalizedAmount,
               СтавкаНДС: vatRateValue,
               СуммаНДС: vatAmountValue,
+              ...(rowCashFlowItemRef ? { СтатьяДвиженияДенежныхСредств_Key: rowCashFlowItemRef } : {}),
               ...(customerInvoiceRef ? { СчетНаОплату_Key: customerInvoiceRef } : {}),
               СчетУчетаРасчетовСКонтрагентом_Key: settle,
               СчетУчетаРасчетовПоАвансам_Key: advance,
@@ -4063,6 +4121,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           bankAccount: { ref: bank.ref, number: bank.number },
           counterparty: { ref: counterparty.ref, name: counterparty.name },
           ...(payerBank ? { payerBankAccount: { ref: payerBank.ref, number: payerBank.number } } : {}),
+          ...(rowCashFlowItemRef ? { rowCashFlowItem: { ref: rowCashFlowItemRef } } : {}),
+          ...(bankLedgerAccountRef ? { bankLedgerAccount: { ref: bankLedgerAccountRef } } : {}),
           contract: {
             ref: contract.ref,
             ...(contract.number ? { number: contract.number } : {}),
@@ -4087,6 +4147,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(documentNumber !== undefined ? { НомерВходящегоДокумента: documentNumber } : {}),
           ...(incomingDate ? { ДатаВходящегоДокумента: incomingDate } : {}),
           ...(cashFlowItemRef ? { СтатьяДвиженияДенежныхСредств_Key: cashFlowItemRef } : {}),
+          ...(bankLedgerAccountRef ? { СчетБанк_Key: bankLedgerAccountRef } : {}),
+          ...(comment !== undefined ? { Комментарий: effectivePayload["Комментарий"] ?? comment } : {}),
+          ...(incomeRecognition ? { ОтражениеВУСН: incomeRecognition } : {}),
           ...(payerBank ? { СчетКонтрагента_Key: payerBank.ref } : {}),
         };
         const effectiveRow =
@@ -4103,6 +4166,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(effectiveRow["СчетУчетаРасчетовПоАвансам_Key"] !== undefined
             ? { СчетУчетаРасчетовПоАвансам_Key: effectiveRow["СчетУчетаРасчетовПоАвансам_Key"] }
             : {}),
+          ...(rowCashFlowItemRef ? { СтатьяДвиженияДенежныхСредств_Key: rowCashFlowItemRef } : {}),
           ...(customerInvoiceRef ? { СчетНаОплату_Key: customerInvoiceRef } : {}),
         };
         const verificationPlan = [

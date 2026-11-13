@@ -88,8 +88,12 @@ JSON-массив или объект `{ "documents": [...] }`; синтетич
       "documentDate": "2026-10-31",
       "vatRate": "НДС18",
       "vatAmount": 180.0,
-      "cashFlowItemRef": "<Ref_Key статьи ДДС, если задана явно>",
+      "cashFlowItemRef": "<Ref_Key статьи ДДС шапки, если задана явно>",
+      "rowCashFlowItemRef": "<Ref_Key статьи ДДС строки, если задана явно>",
       "customerInvoiceRef": "<Ref_Key счёта покупателю, если задан явно>",
+      "bankLedgerAccountRef": "<Ref_Key счёта учёта банка, если задан явно>",
+      "comment": "Комментарий оператора",
+      "incomeRecognition": "Принимаются",
       "contractNumber": "D-1"
     }
   ]
@@ -98,6 +102,8 @@ JSON-массив или объект `{ "documents": [...] }`; синтетич
 
 `number`/`time` — собственный номер и точное время документа (по умолчанию 00:00:00);
 `documentNumber`/`documentDate` — номер и дата **входящего платёжного поручения**, это разные поля.
+`bankLedgerAccountRef` — счёт учёта банка (`СчетБанк_Key`), проверяется в плане счетов; `comment`
+и `incomeRecognition` — необязательные поля шапки, пишутся только при явной передаче.
 `cashFlowItemRef` и `customerInvoiceRef` проверяются на публикацию поля и существование объекта.
 
 `sourceKey` — стабильный ключ строки источника. По нему загрузчик хранит связь с `Ref_Key` документа

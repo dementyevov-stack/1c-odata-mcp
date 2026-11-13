@@ -423,7 +423,11 @@ const argsFor = (
   ...(source.vatRate ? { vatRate: source.vatRate } : {}),
   ...(source.vatAmount !== undefined ? { vatAmount: source.vatAmount } : {}),
   ...(source.cashFlowItemRef ? { cashFlowItemRef: source.cashFlowItemRef } : {}),
+  ...(source.rowCashFlowItemRef ? { rowCashFlowItemRef: source.rowCashFlowItemRef } : {}),
   ...(source.customerInvoiceRef ? { customerInvoiceRef: source.customerInvoiceRef } : {}),
+  ...(source.bankLedgerAccountRef ? { bankLedgerAccountRef: source.bankLedgerAccountRef } : {}),
+  ...(source.comment ? { comment: source.comment } : {}),
+  ...(source.incomeRecognition ? { incomeRecognition: source.incomeRecognition } : {}),
   ...(source.contractNumber ? { contractNumber: source.contractNumber } : {}),
   ...(source.contractRef ? { contractRef: source.contractRef } : {}),
   confirm,
@@ -477,6 +481,9 @@ const SIGNIFICANT_HEADER = [
   "Контрагент_Type",
   "ДоговорКонтрагента_Key",
   "СтатьяДвиженияДенежныхСредств_Key",
+  "СчетБанк_Key",
+  "Комментарий",
+  "ОтражениеВУСН",
   "ВидОперации",
   "СуммаДокумента",
   "НазначениеПлатежа",
@@ -487,6 +494,7 @@ const SIGNIFICANT_HEADER = [
 const SIGNIFICANT_ROW = [
   "ДоговорКонтрагента_Key",
   "СчетНаОплату_Key",
+  "СтатьяДвиженияДенежныхСредств_Key",
   "СчетУчетаРасчетовСКонтрагентом_Key",
   "СчетУчетаРасчетовПоАвансам_Key",
   "СпособПогашенияЗадолженности",
@@ -622,7 +630,14 @@ async function runOne(
 ): Promise<DocumentReport> {
   const sourceHash = hashSource(source, target);
   const hasNewSourceFields = Boolean(
-    source.number || source.time || source.cashFlowItemRef || source.customerInvoiceRef,
+    source.number ||
+    source.time ||
+    source.cashFlowItemRef ||
+    source.rowCashFlowItemRef ||
+    source.customerInvoiceRef ||
+    source.bankLedgerAccountRef ||
+    source.comment ||
+    source.incomeRecognition,
   );
   // Старый отпечаток эквивалентен только пока в источнике нет полей, которых он не знает:
   // иначе добавление номера/времени/ДДС/счёта покупателя должно стать конфликтом, а не already_loaded.

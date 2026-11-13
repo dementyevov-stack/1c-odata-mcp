@@ -535,7 +535,11 @@ describe("подготовка оплаты покупателя", () => {
     ["number", "HIST-1"],
     ["time", "09:10:11"],
     ["cashFlowItemRef", DDS],
+    ["rowCashFlowItemRef", DDS],
     ["customerInvoiceRef", INV],
+    ["bankLedgerAccountRef", ORG],
+    ["comment", "Новый комментарий"],
+    ["incomeRecognition", "Принимаются"],
   ])("добавление исторического поля %s к уже загруженному ключу — конфликт", async (field, value) => {
     const legacySource = {
       ...source,
@@ -795,6 +799,68 @@ describe("банковский счёт организации", () => {
       .map((r) => r.query ?? "");
     expect(bankQueries.some((q) => q !== "" && !q.includes("$filter"))).toBe(true);
     expect(currencyQueries.some((q) => q !== "" && !q.includes("$filter"))).toBe(true);
+  });
+
+  it("явные статья ДДС строки, счёт учёта банка, комментарий и ОтражениеВУСН переносятся и проверяются", async () => {
+    const extended: SourceDocument = {
+      ...source,
+      rowCashFlowItemRef: DDS,
+      bankLedgerAccountRef: ORG,
+      comment: "Комментарий источника",
+      incomeRecognition: "Принимаются",
+    };
+    const { client, fake, journal } = await fixture();
+    const prepared = await runPackage(client, target, [extended], journal, { confirm: false });
+    expect(prepared.documents[0]?.action).toBe("dry_run");
+    const payload = (prepared.documents[0]?.plan as { payload?: Record<string, unknown> }).payload!;
+    expect(payload).toMatchObject({
+      СчетБанк_Key: ORG,
+      Комментарий: "Комментарий источника",
+      ОтражениеВУСН: "Принимаются",
+    });
+    const row = (payload["РасшифровкаПлатежа"] as Array<Record<string, unknown>>)[0]!;
+    expect(row).toMatchObject({ СтатьяДвиженияДенежныхСредств_Key: DDS });
+    expect(prepared.documents[0]?.plan?.["resolved"]).toMatchObject({
+      rowCashFlowItem: { ref: DDS },
+      bankLedgerAccount: { ref: ORG },
+    });
+    const confirmed = await runPackage(client, target, [extended], journal, { confirm: true });
+    expect(confirmed.documents[0]?.action).toBe("created");
+    expect(confirmed.documents[0]?.verification).toBe("ok");
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("несуществующий счёт учёта банка и неверное ОтражениеВУСН блокируют запись", async () => {
+    const { client, fake, journal } = await fixture();
+    const badAccount = await runPackage(
+      client,
+      target,
+      [{ ...source, bankLedgerAccountRef: "12345678-1234-4234-8234-123456789abc" }],
+      journal,
+      { confirm: false },
+    );
+    expect(badAccount.documents[0]?.action).toBe("rejected");
+    expect(badAccount.documents[0]?.note).toContain("Счёт учёта банка");
+    const badIncome = await runPackage(
+      client,
+      target,
+      [{ ...source, incomeRecognition: "Неизвестное" }],
+      journal,
+      { confirm: false },
+    );
+    expect(badIncome.documents[0]?.action).toBe("rejected");
+    expect(badIncome.documents[0]?.note).toContain("ОтражениеВУСН");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("изменение комментария после проверенного плана не подтверждается", async () => {
+    const extended: SourceDocument = { ...source, comment: "Первый комментарий" };
+    const { client, fake, journal } = await fixture();
+    await runPackage(client, target, [extended], journal, { confirm: false });
+    const changed = { ...extended, comment: "Второй комментарий" };
+    const confirmed = await runPackage(client, target, [changed], journal, { confirm: true });
+    expect(confirmed.documents[0]?.action).toBe("blocked");
+    expect(postCount(fake)).toBe(0);
   });
 
   it("несколько банков с одним БИК блокируют создание счёта", async () => {

@@ -58,9 +58,15 @@ export const SourceDocumentSchema = z.object({
   /** Явная историческая ставка и сумма НДС из выписки; обе или ни одной. */
   vatRate: z.string().trim().min(1).max(50).optional(),
   vatAmount: z.number().min(0).optional(),
-  /** Явные ссылки: статья ДДС (шапка) и счёт покупателя (строка расшифровки). */
+  /** Явные ссылки: статья ДДС (шапка), статья ДДС строки, счёт покупателя и счёт учёта банка. */
   cashFlowItemRef: z.string().uuid("cashFlowItemRef должен быть UUID").optional(),
+  rowCashFlowItemRef: z.string().uuid("rowCashFlowItemRef должен быть UUID").optional(),
   customerInvoiceRef: z.string().uuid("customerInvoiceRef должен быть UUID").optional(),
+  bankLedgerAccountRef: z.string().uuid("bankLedgerAccountRef должен быть UUID").optional(),
+  /** Необязательный комментарий шапки; пишется только при явной передаче. */
+  comment: z.string().trim().max(500).optional(),
+  /** Признак отражения в доходах/расходах УСН (поле ОтражениеВУСН). */
+  incomeRecognition: z.string().trim().min(1).max(50).optional(),
   contractNumber: z.string().trim().min(1).max(100).optional(),
   contractRef: z.string().uuid("contractRef должен быть UUID").optional(),
 });
