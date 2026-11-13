@@ -4,7 +4,7 @@
   "display_name": "1С через OData: Бухгалтерия и Торговля",
   "version": "0.15.0",
   "description": "MCP-сервер для 1С:Предприятие через OData: Бухгалтерия 3.0 (аналитика и запись документов с предпросмотром) и Управление торговлей 11 (остатки на складах, продажи с розницей, расчёты с партнёрами — чтение) на естественном языке.",
-  "long_description": "Подключает любой MCP-клиент (Claude, Cursor, VS Code и др.) к базе 1С:Предприятие через стандартный интерфейс OData. Ничего не устанавливается внутри 1С. Конфигурации: Бухгалтерия 3.0 — полностью, Управление торговлей 11 — только чтение (проверено на 11.5), КА 2 и ERP 2 — по тем же регистрам, без проверки на живой базе. По умолчанию только чтение — 80 инструментов и 3 готовых сценария: аналитика Бухгалтерии (дебиторка и кредиторка по срокам, деньги на счетах, неоплаченные счета, проверка закрытия месяца, карточка счёта, акт сверки, остатки, продажи, движение денег, налоги, ОСВ по счёту, проводки документа, хронология для аудита), Управления торговлей (остатки на складах, продажи в штуках с розницей и выручкой, расчёты с клиентами и поставщиками, деньги в кассах и на счетах, список складов), справочники и документы. Запись включается отдельно (readOnly=false), в Управлении торговлей запрещена, и всегда работает в режиме предпросмотра — сначала показывает, что будет создано/изменено, и пишет только после подтверждения.",
+  "long_description": "Подключает любой MCP-клиент (Claude, Cursor, VS Code и др.) к базе 1С:Предприятие через стандартный интерфейс OData. Ничего не устанавливается внутри 1С. Конфигурации: Бухгалтерия 3.0 — полностью, Управление торговлей 11 — только чтение (проверено на 11.5), КА 2 и ERP 2 — по тем же регистрам, без проверки на живой базе. По умолчанию только чтение — 83 инструмента и 3 готовых сценария: аналитика Бухгалтерии (дебиторка и кредиторка по срокам, деньги на счетах, неоплаченные счета, проверка закрытия месяца, карточка счёта, акт сверки, остатки, продажи, движение денег, налоги, ОСВ по счёту, проводки документа, хронология для аудита), Управления торговлей (остатки на складах, продажи в штуках с розницей и выручкой, расчёты с клиентами и поставщиками, деньги в кассах и на счетах, список складов), справочники и документы. Запись включается отдельно (readOnly=false), в Управлении торговлей запрещена, и всегда работает в режиме предпросмотра — сначала показывает, что будет создано/изменено, и пишет только после подтверждения.",
   "author": {
     "name": "evilbruce666",
     "url": "https://github.com/evilbruce666"
@@ -257,12 +257,20 @@
     {
       "name": "read.system.list_organizations",
       "title": "Организации базы",
-      "description": "Список организаций (юрлиц) внутри выбранной базы 1С. Название организации передаётся в параметр organization аналитических инструментов (get_sales, get_debtors, get_cashflow, get_inventory и др.), чтобы получить данные по одному юрлицу.",
+      "description": "Список организаций (юрлиц) внутри выбранной базы 1С. Название организации передаётся в параметр organization аналитических инструментов (get_sales, get_debtors, get_cashflow, get_inventory и др.), чтобы получить данные по одному юрлицу. Для точной сверки задайте ИНН (и при необходимости КПП): сервер прочитает справочник страницами и сверит реквизиты локально, без $top=1. Если фильтр по ИНН у публикации отвечает HTTP 500, будет выполнен ограниченный полный проход. Неполный проход — отказ, а не догадка.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "database": {
             "description": "Имя базы 1С из list_databases. Без указания — база по умолчанию; если баз несколько и неясно какая, спросите пользователя.",
+            "type": "string"
+          },
+          "inn": {
+            "description": "Точный ИНН организации (10 или 12 цифр)",
+            "type": "string"
+          },
+          "kpp": {
+            "description": "Точный КПП организации (9 цифр); только вместе с ИНН",
             "type": "string"
           }
         },
@@ -5705,6 +5713,99 @@
       }
     },
     {
+      "name": "read.organization.find_bank_account",
+      "title": "Банковский счёт организации по номеру",
+      "description": "Сопоставляет банковский счёт именно организации (Owner_Type = Catalog_Организации) по точному номеру. В 1С счёт контрагента и счёт организации — один справочник с разным владельцем; этот инструмент никогда не возвращает счёт контрагента как счёт организации. При неполном проходе или нескольких совпадениях — отказ. Если счёта нет, возвращает found=false и подсказывает write.organization.create_bank_account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "description": "Имя базы 1С из list_databases. Без указания — база по умолчанию; если баз несколько и неясно какая, спросите пользователя.",
+            "type": "string"
+          },
+          "organization": {
+            "description": "Организация-владелец счёта: Ref_Key, название или ИНН",
+            "type": "string"
+          },
+          "accountNumber": {
+            "type": "string",
+            "description": "Точный номер банковского счёта (20 цифр)"
+          }
+        },
+        "required": [
+          "accountNumber"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "type": "string"
+          },
+          "organization": {
+            "type": "object",
+            "properties": {
+              "ref": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ref",
+              "name"
+            ],
+            "additionalProperties": {}
+          },
+          "accountNumber": {
+            "type": "string"
+          },
+          "found": {
+            "type": "boolean"
+          },
+          "account": {
+            "type": "object",
+            "properties": {
+              "ref": {
+                "type": "string"
+              },
+              "number": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ref",
+              "number"
+            ],
+            "additionalProperties": {}
+          },
+          "ownerType": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database",
+          "organization",
+          "accountNumber",
+          "found"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
       "name": "read.audit.get_document_history",
       "title": "Хронология документа (аудит)",
       "description": "Что можно доказуемо сказать о времени документа по данным стандартного OData. Возвращает раздельно: documentDate (Document.Date — учётная дата, не время действия) и refCreatedAt (метка генерации Ref_Key, выведенная из UUIDv1; confidence=derived — НЕ проверенное время создания/выполнения/проведения). Фактическое время выполнения и последнего изменения через стандартный OData недоступны и не возвращаются. Также: ответственный (реквизит документа, не автор), DataVersion как есть (не интерпретируется), наличие движений в регистре Хозрасчетный (только факт наличия), evidence и limitations. Только чтение. documentEntity — Document_* из list_entities, documentRef — Ref_Key.",
@@ -9945,6 +10046,233 @@
       }
     },
     {
+      "name": "write.money.create_payment_from_statement",
+      "title": "Создать оплату покупателя из строки выписки",
+      "description": "Первый участок загрузчика банковских документов БП. Создаёт «Поступление на расчётный счёт» по строке выписки: находит организацию по точным ИНН/КПП, её банковский счёт по номеру, контрагента-покупателя по точным ИНН/КПП и договор по номеру (или единственный подходящий). Явные поля источника переносятся по схеме: ставка и сумма НДС (включая исторические), назначение платежа, номер/дата входящего документа, счёт плательщика, собственный номер/время, статья ДДС шапки и строки, счёт учёта банка, комментарий и ОтражениеВУСН. Если поле не опубликовано или контрольное чтение после создания не совпало — отказ с диагностикой, а не молчаливая потеря данных. Dry-run по умолчанию; для записи передайте operationId из предпросмотра и confirm=true. Стабильный sourceKey делает повторный запуск безопасным.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "description": "Имя базы 1С из list_databases. Без указания — база по умолчанию; если баз несколько и неясно какая, спросите пользователя.",
+            "type": "string"
+          },
+          "sourceKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Стабильный ключ строки источника (например, идентификатор платежа в выписке)"
+          },
+          "organizationInn": {
+            "type": "string",
+            "description": "Точный ИНН организации-получателя"
+          },
+          "organizationKpp": {
+            "description": "Точный КПП организации-получателя",
+            "type": "string"
+          },
+          "orgBankAccountNumber": {
+            "type": "string",
+            "description": "Точный номер банковского счёта организации-получателя (20 цифр)"
+          },
+          "payerInn": {
+            "type": "string",
+            "description": "Точный ИНН плательщика (покупателя)"
+          },
+          "payerKpp": {
+            "description": "Точный КПП плательщика",
+            "type": "string"
+          },
+          "payerName": {
+            "description": "Наименование плательщика в источнике",
+            "type": "string",
+            "maxLength": 300
+          },
+          "payerAccountNumber": {
+            "description": "Точный номер счёта плательщика из выписки (20 цифр), если он есть",
+            "type": "string"
+          },
+          "amount": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Сумма оплаты"
+          },
+          "date": {
+            "type": "string",
+            "description": "Дата документа YYYY-MM-DD"
+          },
+          "number": {
+            "description": "Номер самого документа (отдельно от documentNumber входящего поручения)",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "time": {
+            "description": "Точное время документа HH:MM:SS (по умолчанию 00:00:00)",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "purpose": {
+            "description": "Назначение платежа",
+            "type": "string",
+            "maxLength": 500
+          },
+          "documentNumber": {
+            "description": "Номер входящего банковского документа",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "documentDate": {
+            "description": "Дата входящего банковского документа YYYY-MM-DD",
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+          },
+          "vatRate": {
+            "description": "Явная ставка НДС из выписки (НДС18, НДС20, БезНДС…); только вместе с vatAmount",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 50
+          },
+          "vatAmount": {
+            "description": "Явная сумма НДС из выписки; только вместе с vatRate",
+            "type": "number",
+            "minimum": 0
+          },
+          "cashFlowItemRef": {
+            "description": "Ref_Key статьи ДДС шапки, если она задана явно; проверяется публикация и существование",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "rowCashFlowItemRef": {
+            "description": "Ref_Key статьи ДДС в единственной строке расшифровки; отдельное поле схемы",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "customerInvoiceRef": {
+            "description": "Ref_Key счёта покупателю для строки расшифровки; проверяется публикация и существование",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "bankLedgerAccountRef": {
+            "description": "Ref_Key счёта учёта банка (СчетБанк_Key); проверяется существование в плане счетов",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "comment": {
+            "description": "Явный непустой комментарий шапки документа",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "incomeRecognition": {
+            "description": "ОтражениеВУСН: ВозвратРасхода, НеПринимаются, Принимаются, Распределяются",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 50
+          },
+          "contractNumber": {
+            "description": "Точный номер договора",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "contractRef": {
+            "description": "Ref_Key договора, если он известен",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "confirm": {
+            "default": false,
+            "description": "false (по умолчанию) — только предпросмотр (dry-run), запись НЕ выполняется. true — выполнить создание. Сначала всегда показывайте dry-run и получайте согласие пользователя; при подтверждении передавайте operationId из результата предпросмотра и те же аргументы. После таймаута повторяйте подтверждение с тем же id, не создавая новый предпросмотр.",
+            "type": "boolean"
+          },
+          "operationId": {
+            "description": "UUID из предпросмотра. Передайте его при confirm=true, чтобы повтор не создал дубликат.",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          }
+        },
+        "required": [
+          "sourceKey",
+          "organizationInn",
+          "orgBankAccountNumber",
+          "payerInn",
+          "amount",
+          "date"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "dryRun": {
+            "type": "boolean"
+          },
+          "database": {
+            "type": "string"
+          },
+          "writableBase": {
+            "type": "boolean"
+          },
+          "willCreate": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "created": {
+            "type": "boolean"
+          },
+          "operationId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "entitySet": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": {}
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
       "name": "write.money.create_bank_writeoff",
       "title": "Создать списание с расчётного счёта",
       "description": "Создаёт документ «Списание с расчётного счёта» (исходящий платёж с банка). НЕПРОВЕДЁННЫЙ; провести — post_document. Вид операции ОБЯЗАТЕЛЕН и не угадывается (напр. «ОплатаПоставщику», «ПеречислениеНалога», «ПеречислениеЗП», «ПереводНаДругойСчет», «ПрочееСписание»). Для оплаты поставщику с договором заполняется расшифровка: счёт расчётов — по настройке договора, источник виден в предпросмотре (обычно 60), сумма взаиморасчётов — для рублёвого договора. dry-run/confirm.",
@@ -10618,6 +10946,122 @@
         },
         "required": [
           "ownerRef",
+          "accountNumber",
+          "bik"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "dryRun": {
+            "type": "boolean"
+          },
+          "database": {
+            "type": "string"
+          },
+          "writableBase": {
+            "type": "boolean"
+          },
+          "willCreate": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "created": {
+            "type": "boolean"
+          },
+          "operationId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "entitySet": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": {}
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "write.organization.create_bank_account",
+      "title": "Сопоставить или создать банковский счёт организации",
+      "description": "Нужен перед банковским поступлением, когда у организации ещё нет счёта в 1С. Сначала точным проходом сопоставляет счёт именно организации по номеру (Owner_Type = Catalog_Организации); если он есть — ничего не пишет и возвращает existing=true. Если счёта нет — создаёт его в том же справочнике «Банковские счета» с владельцем-организацией (Owner = Ref_Key организации), а не контрагентом. Dry-run по умолчанию. Счёт контрагента за счёт организации не выдаётся: владелец проверяется до и после записи. Основной счёт организации этот путь не меняет — это делается в 1С осознанно.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "description": "Имя базы 1С из list_databases. Без указания — база по умолчанию; если баз несколько и неясно какая, спросите пользователя.",
+            "type": "string"
+          },
+          "organizationRef": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Ref_Key организации-владельца счёта"
+          },
+          "accountNumber": {
+            "type": "string",
+            "description": "Точный номер расчётного счёта (20 цифр)"
+          },
+          "bik": {
+            "type": "string",
+            "description": "БИК банка (ищется в справочнике «Банки»)"
+          },
+          "currency": {
+            "description": "Валюта (код/название; по умолчанию рубль)",
+            "type": "string"
+          },
+          "label": {
+            "description": "Наименование счёта (по умолчанию — номер счёта)",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "description": "false (по умолчанию) — только предпросмотр (dry-run), запись НЕ выполняется. true — выполнить создание. Сначала всегда показывайте dry-run и получайте согласие пользователя; при подтверждении передавайте operationId из результата предпросмотра и те же аргументы. После таймаута повторяйте подтверждение с тем же id, не создавая новый предпросмотр.",
+            "type": "boolean"
+          },
+          "operationId": {
+            "description": "UUID из предпросмотра. Передайте его при confirm=true, чтобы повтор не создал дубликат.",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          }
+        },
+        "required": [
+          "organizationRef",
           "accountNumber",
           "bik"
         ],

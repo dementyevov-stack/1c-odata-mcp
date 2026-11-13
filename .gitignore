@@ -7,3 +7,6 @@ dist/
 .metadata-cache.json
 coverage/
 *.mcpb
+# Локальные реквизиты и журнал загрузчика банковских документов — не коммитить.
+bank-loader.json
+.bank-loader/

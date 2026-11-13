@@ -25,6 +25,8 @@ export const FAKE_BASE_URL = "https://fake-1c.invalid/odata/standard.odata/";
 export interface FakeRequest {
   method: string;
   resource: string;
+  /** Декодированный query строки запроса — для проверок «не используется $top=1». */
+  query?: string;
 }
 
 export interface Fake1C {
@@ -143,7 +145,14 @@ function syntheticValue(name: string, type: string): unknown {
 const OVERRIDES: Record<string, unknown> = {
   Контрагент: SNAPSHOT_REF,
   Контрагент_Type: "StandardODATA.Catalog_Контрагенты",
-  Owner_Type: "StandardODATA.Catalog_Контрагенты",
+  Owner: SNAPSHOT_REF,
+  Owner_Key: SNAPSHOT_REF,
+  Owner_Type: "StandardODATA.Catalog_Организации",
+  Организация_Key: SNAPSHOT_REF,
+  ИНН: "7700000000",
+  КПП: "770000001",
+  НомерСчета: "40702810000000000001",
+  Номер: "D-1",
   ВидДоговора: "СПокупателем",
   Code: "643",
   Number: "0000-000001",
@@ -233,6 +242,10 @@ export interface FakeOptions {
   schema?: FakeSchema;
   /** Свои строки коллекции; undefined — синтетическая строка, как без опции. */
   data?: (q: FakeQuery) => Record<string, unknown>[] | undefined;
+  /** POST создаёт объект в подделке, но ответ теряется — проверка неизвестного исхода. */
+  dropPostResponse?: boolean;
+  /** Как настоящая 1С, возвращать только поля из $select (для проверки, что _Type не забыт). */
+  respectSelect?: boolean;
 }
 
 /** Параметры функции «Имя=значение,…»: запятая и скобка внутри кавычек — часть значения, '' — кавычка. */
@@ -254,12 +267,24 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
   const postedState = new Map<string, { Posted: boolean; DataVersion: string }>();
   /** Поля шапки, изменённые PATCH в этом прогоне, по тому же пути. */
   const storedState = new Map<string, Record<string, unknown>>();
+  /** Созданные POST объекты: GET по Ref_Key должен их находить, как настоящая 1С. */
+  const createdState = new Map<string, Record<string, unknown>>();
 
   const handle = (url: string, method: string, body: unknown): Response => {
     const raw = url.startsWith(FAKE_BASE_URL) ? url.slice(FAKE_BASE_URL.length) : url;
     const [pathPart = "", query = ""] = raw.split("?");
     const path = decodeURIComponent(pathPart);
     const params = new URLSearchParams(query);
+    const selected = options.respectSelect
+      ? (params.get("$select") ?? "")
+          .split(",")
+          .map((f) => f.trim())
+          .filter(Boolean)
+      : undefined;
+    const project = (row: Record<string, unknown>): Record<string, unknown> =>
+      selected?.length
+        ? Object.fromEntries(Object.entries(row).filter(([field]) => selected.includes(field)))
+        : row;
     if (path === "$metadata")
       return new Response(SCHEMAS[schema].xml, {
         status: 200,
@@ -267,9 +292,11 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
       });
 
     const base = /^[^(/]+/.exec(path)?.[0] ?? path;
-    requests.push({ method, resource: base });
+    requests.push({ method, resource: base, query: decodeURIComponent(query) });
     if (process.env.FAKE_1C_TRACE)
-      process.stderr.write(`[fake-1c] ${method} ${path}?${decodeURIComponent(query)}\n`);
+      process.stderr.write(
+        `[fake-1c] ${method} ${path}?${decodeURIComponent(query)} keyed=${/^[^(]+\([^)]*\)$/.test(path)}\n`,
+      );
     const fields = entityFields(base, schema);
     if (!fields) return odataError(404, `Сущность '${base}' не найдена`);
 
@@ -347,6 +374,14 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
           return odataError(500, `Перечисление 'ВидыОпераций' не содержит элемент '${value}'`);
         }
       }
+      // Создание запоминается по Ref_Key: потерянный ответ не отменяет объект в 1С.
+      if (method === "POST") {
+        const created = { ...syntheticRow(fields, base, schema), ...payload };
+        const ref = String((payload as Record<string, unknown>)["Ref_Key"] ?? created["Ref_Key"] ?? "");
+        if (ref) createdState.set(`${base}(guid'${ref}')`, created);
+        if (options.dropPostResponse) throw new TypeError("fetch failed: ответ потерян (тест)");
+        return json(201, created);
+      }
       // Изменение запоминается: повторное чтение объекта видит сохранённые поля, как в 1С.
       if (method === "PATCH") {
         const doc = /^[^(]+\([^)]*\)/.exec(path)?.[0];
@@ -355,21 +390,31 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
           storedState.set(doc, { ...storedState.get(doc), ...scalars });
         }
       }
-      return json(method === "POST" ? 201 : 200, { ...syntheticRow(fields, base, schema), ...payload });
+      return json(200, { ...syntheticRow(fields, base, schema), ...payload });
     }
 
-    const own = method === "GET" ? options.data?.({ base, ...(fn ? { fn } : {}), args, params }) : undefined;
+    const keyed = tail === "" && /^[^(]+\([^)]*\)$/.test(path);
+    const createdRows = [...createdState.entries()]
+      .filter(([key]) => key.startsWith(`${base}(`))
+      .map(([, row]) => row);
+    const own =
+      method === "GET" && !keyed ? options.data?.({ base, ...(fn ? { fn } : {}), args, params }) : undefined;
     if (own) {
+      // Созданный POST объект 1С видит и в коллекции: иначе повторный подбор счёта не находил бы его.
+      const merged = [...own, ...createdRows.filter((row) => !own.includes(row))];
       const skip = Number(params.get("$skip") ?? 0);
-      const top = params.has("$top") ? Number(params.get("$top")) : own.length;
-      return json(200, { value: own.slice(skip, skip + top) });
+      const top = params.has("$top") ? Number(params.get("$top")) : merged.length;
+      return json(200, { value: merged.slice(skip, skip + top).map(project) });
     }
     if (virtual) {
       const row = syntheticRow(virtual, base, schema);
       for (const [nav, targetFields] of expanded) row[nav] = syntheticRow(targetFields, nav, schema);
       return json(200, { value: [row] });
     }
-    const keyed = tail === "" && /^[^(]+\(/.test(path);
+    if (keyed) {
+      const created = createdState.get(path);
+      if (created) return json(200, project(created));
+    }
     if (Number(params.get("$skip") ?? 0) > 0 && !keyed) return json(200, { value: [] });
     if (base.startsWith("ChartOfAccounts_") && !keyed)
       return json(200, {
@@ -383,7 +428,7 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
     if (Number(params.get("$skip") ?? 0) > 0) return json(200, { value: [] });
     const row = syntheticRow(fields, base, schema);
     const guid = /guid'([0-9a-f-]{36})'/i.exec(path)?.[1];
-    if (keyed && guid && "Ref_Key" in row) row.Ref_Key = guid;
+    if (keyed && guid) row.Ref_Key = guid;
     if (keyed) Object.assign(row, storedState.get(path), postedState.get(path));
     // Составной ключ (регистры сведений): запись отвечает теми значениями измерений, по которым её запросили.
     const key = /^[^(]+\(([^)]*)\)/.exec(path)?.[1] ?? "";
@@ -398,7 +443,10 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
         row[m[1]!] = m[2] ?? m[4] ?? m[3]!.replace(/''/g, "'");
         if (m[5] && `${m[1]}_Type` in row) row[`${m[1]}_Type`] = `StandardODATA.${m[5]}`;
       }
-    return json(200, keyed ? row : { value: [row] });
+    return json(
+      200,
+      keyed ? project(row) : { value: (createdRows.length ? createdRows : [row]).map(project) },
+    );
   };
 
   vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {

@@ -1,7 +1,7 @@
 {
   "name": "1c-odata-mcp",
   "version": "0.15.0",
-  "description": "MCP server for 1C:Enterprise (1С) over OData — 1C:Accounting 3.0 and 1C:Trade Management 11 (read-only). Ask in natural language: debtors and creditors by due date, unpaid invoices, cash, month-close checks, account cards, reconciliation statements, sales, taxes, postings; stock by warehouse, unit sales with retail, customer and supplier balances. Any MCP client (Claude, Cursor, VS Code, local models…). 80 tools, run with npx, nothing installed inside 1C; read-only by default with opt-in (gated) write.",
+  "description": "MCP server for 1C:Enterprise (1С) over OData — 1C:Accounting 3.0 and 1C:Trade Management 11 (read-only). Ask in natural language: debtors and creditors by due date, unpaid invoices, cash, month-close checks, account cards, reconciliation statements, sales, taxes, postings; stock by warehouse, unit sales with retail, customer and supplier balances. Any MCP client (Claude, Cursor, VS Code, local models…). 83 tools, run with npx, nothing installed inside 1C; read-only by default with opt-in (gated) write.",
   "type": "module",
   "bin": {
     "1c-odata-mcp": "dist/index.js"
@@ -41,7 +41,8 @@
     "test:live": "npm run build && node --env-file=.env dist/scripts/live-write.js",
     "test:live:read": "npm run build && node --env-file=.env dist/scripts/live-read.js",
     "budget:update": "UPDATE_REQUEST_BUDGET=1 vitest run test/fake-1c.test.ts",
-    "snapshot:metadata": "npm run build && node --env-file=.env dist/scripts/snapshot-metadata.js"
+    "snapshot:metadata": "npm run build && node --env-file=.env dist/scripts/snapshot-metadata.js",
+    "bank-loader": "node dist/scripts/bp-loader.js"
   },
   "keywords": [
     "mcp",
@@ -78,6 +79,7 @@
     "node": ">=22"
   },
   "dependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
     "@modelcontextprotocol/node": "^2.1.2",
     "@modelcontextprotocol/server": "^2.4.0",
     "fast-xml-parser": "^5.12.0",
@@ -86,7 +88,6 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@modelcontextprotocol/client": "^2.4.0",
     "@types/node": "^26.6.6",
     "eslint": "^10.14.0",
     "eslint-config-prettier": "^10.1.8",

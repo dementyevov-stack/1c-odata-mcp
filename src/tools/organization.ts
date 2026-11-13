@@ -2,13 +2,14 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import type { Connection, ServerContext } from "../context.js";
 import { ok, fail, guard, databaseField, organizationField } from "./_shared.js";
 import { CATALOGS, REGISTERS, resolveEntity } from "../config/mapping.js";
-import { resolveOrgOrDefault } from "../odata/orgs.js";
+import { findBankAccountsByOwnerAndNumber } from "../odata/bank-receipt.js";
+import { resolveOrgOrDefault, resolveOrganization } from "../odata/orgs.js";
 import { resolveNames } from "../odata/accounting.js";
 import { KI_KINDS } from "../odata/refdata.js";
 import { fetchAll } from "../odata/pagination.js";
 import { cmp, odataGuid, buildQuery } from "../odata/query.js";
 import type { ODataEntity } from "../types/odata.js";
-import { organizationCardResultSchema } from "../schemas/output.js";
+import { bankAccountLookupResultSchema, organizationCardResultSchema } from "../schemas/output.js";
 import { z } from "zod";
 
 /**
@@ -275,6 +276,62 @@ export function registerOrganizationTools(server: McpServer, ctx: ServerContext)
             notes: notes.length ? notes : undefined,
           }),
         );
+      }),
+  );
+
+  server.registerTool(
+    "read.organization.find_bank_account",
+    {
+      title: "Банковский счёт организации по номеру",
+      description:
+        "Сопоставляет банковский счёт именно организации (Owner_Type = Catalog_Организации) по точному " +
+        "номеру. В 1С счёт контрагента и счёт организации — один справочник с разным владельцем; " +
+        "этот инструмент никогда не возвращает счёт контрагента как счёт организации. При неполном " +
+        "проходе или нескольких совпадениях — отказ. Если счёта нет, возвращает found=false и " +
+        "подсказывает write.organization.create_bank_account.",
+      inputSchema: z.object({
+        database: databaseField,
+        organization: organizationField.describe("Организация-владелец счёта: Ref_Key, название или ИНН"),
+        accountNumber: z.string().trim().describe("Точный номер банковского счёта (20 цифр)"),
+      }),
+      outputSchema: bankAccountLookupResultSchema,
+    },
+    ({ database, organization, accountNumber }) =>
+      guard("read.organization.find_bank_account", async () => {
+        if (!organization) return fail("Укажите организацию: Ref_Key, название или ИНН.", "input");
+        const conn = ctx.db(database);
+        const org = await resolveOrganization(conn, organization);
+        const orgSet = resolveEntity(CATALOGS.organizations, await conn.available());
+        if (!orgSet) return fail("Справочник «Организации» не опубликован в OData.", "not_published");
+        const ownerType = `StandardODATA.${orgSet}`;
+        const found = await findBankAccountsByOwnerAndNumber(conn, org.ref, accountNumber, ownerType);
+        if (found.truncated)
+          return fail(
+            "Банковские счета: достигнут предел строк, проход неполный. Нельзя утверждать, " +
+              "что счёт с таким номером один. Увеличьте ODATA_MAX_ROWS.",
+            "input",
+          );
+        if (found.accounts.length > 1)
+          return fail(
+            `У организации ${org.name} несколько счетов с номером ${accountNumber} — исправьте справочник 1С.`,
+            "refused",
+          );
+        const account = found.accounts[0];
+        return ok({
+          database: conn.cfg.name,
+          organization: { ref: org.ref, name: org.name },
+          accountNumber,
+          found: Boolean(account),
+          ...(account ? { account } : {}),
+          ownerType,
+          ...(account
+            ? {}
+            : {
+                note:
+                  "Счёта организации с таким номером нет. Создайте его через " +
+                  "write.organization.create_bank_account (Owner_Type организации), не подставляйте счёт контрагента.",
+              }),
+        });
       }),
   );
 }
