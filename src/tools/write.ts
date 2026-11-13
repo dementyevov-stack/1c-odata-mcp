@@ -3585,8 +3585,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       inputSchema: z.object({
         database: databaseField,
         organization: organizationField,
-        counterpartyRef: z.string().describe("Ref_Key покупателя"),
-        contractRef: z.string().describe("Ref_Key договора"),
+        counterpartyRef: z.string().optional().describe("Ref_Key покупателя (для обычного режима)"),
+        contractRef: z.string().optional().describe("Ref_Key договора (для обычного режима)"),
         operationKind: z
           .string()
           .trim()
@@ -3600,6 +3600,30 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         amount: z.number().positive().describe("Сумма оплаты"),
         orgBankAccount: orgBankAccountField,
         date: z.string().optional().describe("Дата YYYY-MM-DD (по умолчанию сегодня)"),
+        number: z.string().trim().min(1).max(100).optional().describe("Исторический номер документа"),
+        time: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Время документа"),
+        incomingNumber: z.string().trim().min(1).max(100).optional().describe("Входящий номер"),
+        incomingDate: z.string().optional().describe("Входящая дата YYYY-MM-DD"),
+        incomingTime: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Входящее время"),
+        bankAccountingAccountRef: z.string().uuid().optional().describe("СчетБанк_Key (51)"),
+        settlementAccountRef: z.string().uuid().optional().describe("Счёт расчётов (55.03)"),
+        cashflowItemRef: z.string().uuid().optional().describe("Статья ДДС шапки"),
+        rowCashflowItemRef: z.string().uuid().optional().describe("Статья ДДС строки"),
+        vatRate: z
+          .union([z.literal("НДС20"), z.literal("")])
+          .optional()
+          .describe("Историческая ставка НДС или пусто"),
+        usnReflection: z.string().optional().describe("ОтражениеВУСН"),
+        purposeText: z.string().optional().describe("Назначение платежа"),
+        comment: z.string().optional().describe("Комментарий"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
@@ -3613,6 +3637,19 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       amount,
       orgBankAccount,
       date,
+      number,
+      time,
+      incomingNumber,
+      incomingDate,
+      incomingTime,
+      bankAccountingAccountRef,
+      settlementAccountRef,
+      cashflowItemRef,
+      rowCashflowItemRef,
+      vatRate,
+      usnReflection,
+      purposeText,
+      comment,
       confirm,
     }) =>
       guard("write.money.create_payment", async () => {
@@ -3623,36 +3660,216 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           "Документ «Поступление на расчётный счёт»",
         );
         const org = await resolveOrg(conn, organization);
+        const historical =
+          number !== undefined ||
+          time !== undefined ||
+          incomingNumber !== undefined ||
+          incomingDate !== undefined ||
+          incomingTime !== undefined ||
+          bankAccountingAccountRef !== undefined ||
+          settlementAccountRef !== undefined ||
+          cashflowItemRef !== undefined ||
+          rowCashflowItemRef !== undefined ||
+          vatRate !== undefined ||
+          usnReflection !== undefined ||
+          purposeText !== undefined ||
+          comment !== undefined;
+        if (!historical) {
+          if (!counterpartyRef || !contractRef)
+            throw new InputError("Для обычного поступления нужны counterpartyRef и contractRef.");
+          const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
+          const codes = conn.cfg?.accounting?.strictDefaults
+            ? new Map<AccountDefault, string | undefined>()
+            : await resolveDefaultAccounts(conn, ["receivable", "receivableAdvance"]);
+          const settle = codes.get("receivable");
+          const advance = codes.get("receivableAdvance");
+          const cpSet = resolveEntity(CATALOGS.counterparties, await conn.available());
+          const payload = clean({
+            Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
+            Posted: false,
+            ВидОперации: configuredOperationKind(conn.cfg, "customerPayment", operationKind),
+            Организация_Key: org.key,
+            СчетОрганизации_Key: bank,
+            Контрагент: counterpartyRef,
+            ...(cpSet ? { Контрагент_Type: `StandardODATA.${cpSet}` } : {}),
+            ДоговорКонтрагента_Key: contractRef,
+            СуммаДокумента: amount,
+            РасшифровкаПлатежа: [
+              clean({
+                LineNumber: 1,
+                ДоговорКонтрагента_Key: contractRef,
+                СпособПогашенияЗадолженности: "Автоматически",
+                СуммаПлатежа: amount,
+                СтавкаНДС: "БезНДС",
+                СчетУчетаРасчетовСКонтрагентом_Key: settle,
+                СчетУчетаРасчетовПоАвансам_Key: advance,
+              }),
+            ],
+          });
+          return createOrPreview(conn, set, payload, confirm, undefined, { settlementSide: "customer" });
+        }
+        if (!number) throw new InputError("Исторический депозит требует number.");
+        if (!date) throw new InputError("Исторический депозит требует date.");
+        if (!bankAccountingAccountRef || !settlementAccountRef)
+          throw new InputError(
+            "Исторический депозит требует bankAccountingAccountRef и settlementAccountRef.",
+          );
+        if (!cashflowItemRef || !rowCashflowItemRef)
+          throw new InputError("Исторический депозит требует статьи ДДС в шапке и строке.");
+        if (!orgBankAccount || !GUID_RE.test(orgBankAccount))
+          throw new InputError("Исторический депозит требует Ref_Key счёта организации.");
+        const props = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        const need = (field: string, type: string): void => {
+          if (props.get(field) !== type)
+            throw new InputError(`Схема поступления не публикует ${field} с типом ${type}.`);
+        };
+        for (const [field, type] of [
+          ["Number", "Edm.String"],
+          ["Date", "Edm.DateTime"],
+          ["ВидОперации", "Edm.String"],
+          ["Организация_Key", "Edm.Guid"],
+          ["СчетОрганизации_Key", "Edm.Guid"],
+          ["СуммаДокумента", "Edm.Double"],
+          ["СчетБанк_Key", "Edm.Guid"],
+          ["СчетУчетаРасчетовСКонтрагентом_Key", "Edm.Guid"],
+          ["СтатьяДвиженияДенежныхСредств_Key", "Edm.Guid"],
+          ["НазначениеПлатежа", "Edm.String"],
+          ["Комментарий", "Edm.String"],
+          ["ОтражениеВУСН", "Edm.String"],
+          [
+            "РасшифровкаПлатежа",
+            "Collection(StandardODATA.Document_ПоступлениеНаРасчетныйСчет_РасшифровкаПлатежа_RowType)",
+          ],
+          ["Posted", "Edm.Boolean"],
+          ["DeletionMark", "Edm.Boolean"],
+        ] as const)
+          need(field, type);
+        await accountsByRef(conn, [bankAccountingAccountRef, settlementAccountRef]);
         const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
-        const codes = conn.cfg?.accounting?.strictDefaults
-          ? new Map<AccountDefault, string | undefined>()
-          : await resolveDefaultAccounts(conn, ["receivable", "receivableAdvance"]);
-        const settle = codes.get("receivable");
-        const advance = codes.get("receivableAdvance");
-        const cpSet = resolveEntity(CATALOGS.counterparties, await conn.available());
+        const docDate = new Date(`${date}T${time ?? "00:00:00"}`);
+        const incoming = incomingDate
+          ? odataDate(new Date(`${incomingDate}T${incomingTime ?? "00:00:00"}`))
+          : undefined;
+        const row = clean({
+          LineNumber: 1,
+          СуммаПлатежа: amount,
+          СтатьяДвиженияДенежныхСредств_Key: rowCashflowItemRef,
+          ...(vatRate !== undefined ? { СтавкаНДС: vatRate } : {}),
+        });
         const payload = clean({
-          Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
+          Date: odataDate(docDate),
+          Number: number.trim(),
           Posted: false,
-          ВидОперации: configuredOperationKind(conn.cfg, "customerPayment", operationKind),
+          ВидОперации: "Депозит",
           Организация_Key: org.key,
           СчетОрганизации_Key: bank,
-          Контрагент: counterpartyRef,
-          ...(cpSet ? { Контрагент_Type: `StandardODATA.${cpSet}` } : {}),
-          ДоговорКонтрагента_Key: contractRef,
+          СчетБанк_Key: bankAccountingAccountRef,
+          СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef,
+          ...(incomingNumber ? { НомерВходящегоДокумента: incomingNumber } : {}),
+          ...(incoming ? { ДатаВходящегоДокумента: incoming } : {}),
           СуммаДокумента: amount,
-          РасшифровкаПлатежа: [
-            clean({
-              LineNumber: 1,
-              ДоговорКонтрагента_Key: contractRef,
-              СпособПогашенияЗадолженности: "Автоматически", // иначе платёж не распределяется и нет проводок
-              СуммаПлатежа: amount,
-              СтавкаНДС: "БезНДС",
-              СчетУчетаРасчетовСКонтрагентом_Key: settle,
-              СчетУчетаРасчетовПоАвансам_Key: advance,
-            }),
-          ],
+          СтатьяДвиженияДенежныхСредств_Key: cashflowItemRef,
+          НазначениеПлатежа: purposeText,
+          Комментарий: comment,
+          ОтражениеВУСН: usnReflection,
+          РасшифровкаПлатежа: [row],
         });
-        return createOrPreview(conn, set, payload, confirm, undefined, { settlementSide: "customer" });
+        const select = ["Ref_Key", "Number", "Date", "Организация_Key"];
+        const read = await fetchAll<ODataEntity>(
+          conn.client,
+          set,
+          {
+            filter: and(
+              cmp("Number", "eq", odataString(number.trim())),
+              cmp("Организация_Key", "eq", odataGuid(org.key)),
+            ),
+            select,
+          },
+          conn.behavior.pageSize,
+          5_000,
+        );
+        if (read.truncated) throw new InputError("Проверка дубля депозита: достигнут предел строк.");
+        const year = String(odataDate(docDate)).slice(0, 4);
+        const duplicate = read.rows.find((r) => String(r["Date"] ?? "").slice(0, 4) === year);
+        if (duplicate)
+          throw new InputError(
+            `Номер «${number}» уже занят документом ${String(duplicate["Ref_Key"] ?? "")} за ${year} год.`,
+          );
+        const created = await createOrPreview(conn, set, payload, confirm);
+        if (!confirm || created.isError) return created;
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+        if (!ref) return created;
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch {
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              { type: "text", text: "Депозит создан, но контрольное чтение не удалось; повтор запрещён." },
+            ],
+            structuredContent: { ...createdData, verification: "failed" },
+          };
+        }
+        const expected: Record<string, unknown> = {
+          Number: payload["Number"],
+          Date: payload["Date"],
+          Posted: false,
+          DeletionMark: false,
+          ВидОперации: "Депозит",
+          Организация_Key: org.key,
+          СчетОрганизации_Key: bank,
+          СчетБанк_Key: bankAccountingAccountRef,
+          СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef,
+          ...(incomingNumber ? { НомерВходящегоДокумента: incomingNumber } : {}),
+          ...(incoming ? { ДатаВходящегоДокумента: incoming } : {}),
+          СуммаДокумента: amount,
+          СтатьяДвиженияДенежныхСредств_Key: cashflowItemRef,
+          ...(purposeText !== undefined ? { НазначениеПлатежа: purposeText } : {}),
+          ...(comment !== undefined ? { Комментарий: comment } : {}),
+          ...(usnReflection !== undefined ? { ОтражениеВУСН: usnReflection } : {}),
+        };
+        const mismatch: string[] = [];
+        const types = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        for (const [field, value] of Object.entries(expected))
+          if (!sameStoredValue(value, actual[field], types.get(field) ?? "Edm.String")) mismatch.push(field);
+        const rows = actual["РасшифровкаПлатежа"];
+        if (!Array.isArray(rows) || rows.length !== 1) mismatch.push("РасшифровкаПлатежа");
+        else {
+          const r = rows[0] as Record<string, unknown>;
+          for (const [field, value] of Object.entries(row))
+            if (!sameStoredValue(value, r[field], "Edm.String")) mismatch.push(`РасшифровкаПлатежа.${field}`);
+          if (r["СуммаНДС"] != null && Number(r["СуммаНДС"]) !== 0)
+            mismatch.push("РасшифровкаПлатежа.СуммаНДС");
+        }
+        if (mismatch.length)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text: `Депозит создан (Ref_Key ${ref}), но контрольное чтение не подтвердило: ${mismatch.join(", ")}. Повтор запрещён.`,
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed", mismatches: mismatch },
+          };
+        return {
+          ...created,
+          structuredContent: {
+            ...createdData,
+            verification: "ok",
+            verifiedFields: [...Object.keys(expected), "РасшифровкаПлатежа"],
+          },
+        };
       }),
   );
 
