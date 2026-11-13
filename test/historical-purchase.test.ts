@@ -26,6 +26,7 @@ async function setup(
     rowWarehouse?: string;
     rowUnit?: string;
     rowCoefficient?: number;
+    serviceQuantity?: number;
     contractKind?: string;
   } = {},
 ) {
@@ -50,7 +51,18 @@ async function setup(
         ...(options.rowUnit !== undefined ? { ЕдиницаИзмерения_Key: options.rowUnit } : {}),
         ...(options.rowCoefficient !== undefined ? { Коэффициент: options.rowCoefficient } : {}),
       }));
-      return { DeletionMark: false, ...actual, Товары: rows };
+      const services = Array.isArray(actual["Услуги"])
+        ? (actual["Услуги"] as Array<Record<string, unknown>>).map((row) => ({
+            ...row,
+            ...(options.serviceQuantity !== undefined ? { Количество: options.serviceQuantity } : {}),
+          }))
+        : actual["Услуги"];
+      return {
+        DeletionMark: false,
+        ...actual,
+        Товары: rows,
+        ...(services !== undefined ? { Услуги: services } : {}),
+      };
     }
     return original(path);
   });
@@ -294,6 +306,100 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
     const operationId = preview.structuredContent?.operationId;
     const created = await call(client, { ...serviceOnly, confirm: true, operationId });
     expect(created.isError, JSON.stringify(created)).toBeFalsy();
+  });
+
+  it("emptyQuantity услуги: без подстановки 1, с явными суммой и НДС", async () => {
+    const { client, fake } = await setup();
+    const emptyService = {
+      ...args,
+      lines: undefined,
+      warehouse: undefined,
+      sumIncludesVat: true,
+      documentTotal: 120,
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          emptyQuantity: true,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          content: "Услуга без количества",
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+        },
+      ],
+    };
+    const preview = await call(client, { ...emptyService, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const row = (preview.structuredContent?.payload as Record<string, unknown>)["Услуги"] as Array<
+      Record<string, unknown>
+    >;
+    expect(row[0]).not.toHaveProperty("Количество");
+    expect(row[0]).toMatchObject({ Сумма: 100, СуммаНДС: 20 });
+    expect(preview.structuredContent?.quantityVerification).toBe("pending_live_validation");
+    const operationId = preview.structuredContent?.operationId;
+    const created = await call(client, { ...emptyService, confirm: true, operationId });
+    expect(created.isError, JSON.stringify(created)).toBeFalsy();
+    expect(created.structuredContent).toMatchObject({
+      verification: "ok",
+      quantityVerification: "pending_live_validation",
+    });
+    expect(postCount(fake)).toBe(1);
+  });
+
+  it("emptyQuantity услуги требует amount/vatAmount и не сочетается с quantity", async () => {
+    const { client, fake } = await setup();
+    const missing = await call(client, {
+      ...args,
+      lines: undefined,
+      serviceLines: [{ nomenclatureRef: NOM, emptyQuantity: true, price: 100 }],
+      confirm: false,
+    });
+    expect(missing.isError).toBe(true);
+    const both = await call(client, {
+      ...args,
+      lines: undefined,
+      serviceLines: [
+        { nomenclatureRef: NOM, quantity: 1, emptyQuantity: true, price: 100, amount: 100, vatAmount: 20 },
+      ],
+      confirm: false,
+    });
+    expect(both.isError).toBe(true);
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("непустое количество после записи пустой услуги ломает verification", async () => {
+    const { client } = await setup({ serviceQuantity: 1 });
+    const emptyService = {
+      ...args,
+      lines: undefined,
+      warehouse: undefined,
+      sumIncludesVat: true,
+      documentTotal: 120,
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          emptyQuantity: true,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+        },
+      ],
+    };
+    const preview = await call(client, { ...emptyService, confirm: false });
+    const created = await call(client, {
+      ...emptyService,
+      confirm: true,
+      operationId: preview.structuredContent?.operationId,
+    });
+    expect(created.isError, JSON.stringify(created)).toBe(true);
+    expect(JSON.stringify(created)).toContain("Количество");
   });
 
   it("подтверждает и полностью проверяет readback", async () => {

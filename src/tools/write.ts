@@ -3097,18 +3097,34 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
     ref: z.string().uuid().describe("Ref_Key аналитики"),
     type: z.string().trim().min(1).max(200).describe("Тип ссылки, напр. StandardODATA.Catalog_Контрагенты"),
   });
-  const historicalPurchaseServiceLine = z.object({
-    ...baseLineShape,
-    vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические"),
-    amount: z.number().nonnegative().optional().describe("Явная сумма строки"),
-    vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
-    sourceLineId: z.string().trim().min(1).max(200).optional().describe("ИдентификаторСтроки источника"),
-    costAccountRef: z.string().uuid().optional().describe("Ref_Key счёта затрат БУ"),
-    costAccountNuRef: z.string().uuid().optional().describe("Ref_Key счёта затрат НУ"),
-    vatAccountRef: z.string().uuid().optional().describe("Ref_Key счёта входящего НДС"),
-    analytics: z.array(purchaseAnalytic).max(3).optional().describe("Субконто БУ1..3"),
-    analyticsNu: z.array(purchaseAnalytic).max(3).optional().describe("СубконтоНУ1..3"),
-  });
+  const historicalPurchaseServiceLine = z
+    .object({
+      ...baseLineShape,
+      quantity: z.number().positive().optional().describe("Количество; при emptyQuantity не задаётся"),
+      emptyQuantity: z.boolean().optional().describe("Opt-in: количество в источнике пустое"),
+      vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические"),
+      amount: z.number().nonnegative().optional().describe("Явная сумма строки"),
+      vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
+      sourceLineId: z.string().trim().min(1).max(200).optional().describe("ИдентификаторСтроки источника"),
+      costAccountRef: z.string().uuid().optional().describe("Ref_Key счёта затрат БУ"),
+      costAccountNuRef: z.string().uuid().optional().describe("Ref_Key счёта затрат НУ"),
+      vatAccountRef: z.string().uuid().optional().describe("Ref_Key счёта входящего НДС"),
+      analytics: z.array(purchaseAnalytic).max(3).optional().describe("Субконто БУ1..3"),
+      analyticsNu: z.array(purchaseAnalytic).max(3).optional().describe("СубконтоНУ1..3"),
+    })
+    .superRefine((line, ctx) => {
+      if (line.emptyQuantity) {
+        if (line.quantity !== undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity нельзя сочетать с quantity." });
+        if (line.amount === undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity требует явную amount." });
+        if (line.vatAmount === undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity требует явный vatAmount." });
+        return;
+      }
+      if (line.quantity === undefined)
+        ctx.addIssue({ code: "custom", message: "quantity обязателен или задайте emptyQuantity=true." });
+    });
 
   server.registerTool(
     "write.purchase.create_purchase",
@@ -3206,7 +3222,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           universalDocument !== undefined ||
           operationKind !== undefined ||
           allowGenericContractKind !== undefined ||
-          serviceLines !== undefined ||
+          serviceLines?.some((line) => line.emptyQuantity === true) ||
           goodsLines.some(
             (line) =>
               line.amount !== undefined ||
@@ -3447,6 +3463,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ...(l.warehouseEmpty ? { Склад_Key: EMPTY_GUID } : {}),
           });
         });
+        const emptyServiceQuantity = (serviceLines ?? []).some((l) => l.emptyQuantity === true);
         const serviceRows = (serviceLines ?? []).map((l, i) => {
           const analytics = (
             items: typeof l.analytics | undefined,
@@ -3465,9 +3482,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             LineNumber: i + 1,
             Номенклатура_Key: l.nomenclatureRef,
             ...(l.content === undefined ? {} : { Содержание: l.content }),
-            Количество: l.quantity,
+            ...(l.emptyQuantity ? {} : { Количество: l.quantity }),
             Цена: l.price,
-            Сумма: l.amount ?? lineSum(l),
+            Сумма: l.amount ?? (l.emptyQuantity ? undefined : lineSum(l as GoodsLine)),
             СтавкаНДС: l.vatRate,
             ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
             ...(l.costAccountRef !== undefined ? { СчетЗатрат_Key: l.costAccountRef } : {}),
@@ -3564,7 +3581,19 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             effectivePayload = prepared;
           },
         });
-        if (!confirm || created.isError) return created;
+        if (!confirm || created.isError) {
+          if (!confirm && historical)
+            return withStructured(created, {
+              ...(emptyServiceQuantity
+                ? {
+                    quantityVerification: "pending_live_validation",
+                    quantityNote:
+                      "Количество услуги не отправлено; представление пустого числа в 1С проверяется после записи.",
+                  }
+                : {}),
+            });
+          return created;
+        }
         const createdData = created.structuredContent as Record<string, unknown> | undefined;
         const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
         if (!ref) return created;
@@ -3669,6 +3698,16 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
                     expected: value,
                     actual: actualRow[field],
                   });
+              if (serviceLines?.[index]?.emptyQuantity) {
+                const stored = actualRow["Количество"];
+                const empty = stored == null || stored === "" || Number(stored) === 0;
+                if (!empty)
+                  mismatches.push({
+                    field: `Услуги[${index + 1}].Количество`,
+                    expected: "пусто/0",
+                    actual: stored,
+                  });
+              }
             });
           }
         }
@@ -3687,6 +3726,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           };
         return withStructured(created, {
           verification: "ok",
+          ...(emptyServiceQuantity ? { quantityVerification: "pending_live_validation" } : {}),
           verifiedFields: [
             ...Object.keys(expectedHeader),
             ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Товары[${i + 1}].${field}`)),
