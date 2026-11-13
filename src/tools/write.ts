@@ -3699,6 +3699,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
     return cpSet ? { Контрагент_Type: `StandardODATA.${cpSet}` } : {};
   };
 
+  const bankSubconto = z.object({
+    ref: z.string().uuid().describe("Ref_Key субконто"),
+    type: z.string().trim().min(1).max(200).describe("Тип ссылки субконто"),
+  });
+
   server.registerTool(
     "write.money.create_bank_writeoff",
     {
@@ -3724,6 +3729,27 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         orgBankAccount: orgBankAccountField,
         date: z.string().optional().describe("Дата YYYY-MM-DD (по умолчанию сегодня)"),
         comment: z.string().optional().describe("Комментарий"),
+        number: z.string().trim().min(1).max(100).optional().describe("Исторический номер документа"),
+        time: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Время документа"),
+        incomingNumber: z.string().trim().min(1).max(100).optional().describe("Входящий номер"),
+        incomingDate: z.string().optional().describe("Входящая дата YYYY-MM-DD"),
+        incomingTime: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Входящее время"),
+        bankAccountingAccountRef: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("Счёт учёта банковского счёта (СчетБанк_Key)"),
+        debitAccountRef: z.string().uuid().optional().describe("Дебетовый счёт"),
+        subconto: z.array(bankSubconto).max(3).optional().describe("Типизированное субконто Дт1..3"),
+        recipientBankAccountRef: z.string().uuid().optional().describe("Банковский счёт получателя"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
@@ -3740,6 +3766,15 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       orgBankAccount,
       date,
       comment,
+      number,
+      time,
+      incomingNumber,
+      incomingDate,
+      incomingTime,
+      bankAccountingAccountRef,
+      debitAccountRef,
+      subconto,
+      recipientBankAccountRef,
       confirm,
     }) =>
       guard("write.money.create_bank_writeoff", async () => {
@@ -3750,6 +3785,253 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           "Документ «Списание с расчётного счёта»",
         );
         const org = await resolveOrg(conn, organization);
+        const historical =
+          number !== undefined ||
+          time !== undefined ||
+          incomingNumber !== undefined ||
+          incomingDate !== undefined ||
+          incomingTime !== undefined ||
+          bankAccountingAccountRef !== undefined ||
+          debitAccountRef !== undefined ||
+          subconto !== undefined ||
+          recipientBankAccountRef !== undefined;
+        if (historical) {
+          if (!number) throw new InputError("Историческая комиссия банка требует number.");
+          if (!date) throw new InputError("Историческая комиссия банка требует date.");
+          if (!orgBankAccount || !GUID_RE.test(orgBankAccount))
+            throw new InputError("Историческая комиссия банка требует Ref_Key счёта организации.");
+          const props = new Map(
+            (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          const need = (field: string, type: string): void => {
+            if (props.get(field) !== type)
+              throw new InputError(`Схема списания не публикует ${field} с типом ${type}.`);
+          };
+          for (const [field, type] of [
+            ["Number", "Edm.String"],
+            ["Date", "Edm.DateTime"],
+            ["ВидОперации", "Edm.String"],
+            ["Организация_Key", "Edm.Guid"],
+            ["СчетОрганизации_Key", "Edm.Guid"],
+            ["СуммаДокумента", "Edm.Double"],
+            ["СчетБанк_Key", "Edm.Guid"],
+            ["СчетУчетаРасчетовСКонтрагентом_Key", "Edm.Guid"],
+            ["СтатьяДвиженияДенежныхСредств_Key", "Edm.Guid"],
+            ["СубконтоДт1", "Edm.String"],
+            ["СубконтоДт1_Type", "Edm.String"],
+            [
+              "РасшифровкаПлатежа",
+              "Collection(StandardODATA.Document_СписаниеСРасчетногоСчета_РасшифровкаПлатежа_RowType)",
+            ],
+            ["Posted", "Edm.Boolean"],
+            ["DeletionMark", "Edm.Boolean"],
+          ] as const)
+            need(field, type);
+          if (incomingNumber !== undefined) need("НомерВходящегоДокумента", "Edm.String");
+          if (incomingDate !== undefined) need("ДатаВходящегоДокумента", "Edm.DateTime");
+          if (recipientBankAccountRef !== undefined) need("СчетКонтрагента_Key", "Edm.Guid");
+          let counterpartyType: string | undefined;
+          if (counterpartyRef !== undefined) {
+            if (!GUID_RE.test(counterpartyRef))
+              throw new InputError("counterpartyRef должен быть Ref_Key (GUID).");
+            need("Контрагент", "Edm.String");
+            need("Контрагент_Type", "Edm.String");
+            const cpSet = resolveEntity(CATALOGS.counterparties, await conn.available());
+            if (!cpSet) throw new InputError("Справочник «Контрагенты» не опубликован.");
+            const cp = await conn.client.getEntity(
+              `${cpSet}(${odataGuid(counterpartyRef)})?$format=json&$select=Ref_Key,DeletionMark,IsFolder`,
+            );
+            if (
+              String(cp["Ref_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== counterpartyRef.toLowerCase()
+            )
+              throw new InputError(`Контрагент ${counterpartyRef} не найден.`);
+            if (cp["DeletionMark"] === true) throw new InputError("Контрагент помечен на удаление.");
+            if (cp["IsFolder"] === true) throw new InputError("Контрагент является группой.");
+            counterpartyType = `StandardODATA.${cpSet}`;
+          }
+          if (recipientBankAccountRef !== undefined) {
+            if (counterpartyRef === undefined)
+              throw new InputError(
+                "recipientBankAccountRef требует явный counterpartyRef для проверки владельца.",
+              );
+            const bankSet = resolveEntity(CATALOGS.bankAccounts, await conn.available());
+            if (!bankSet) throw new InputError("Справочник «Банковские счета» не опубликован.");
+            const recipient = await conn.client.getEntity(
+              `${bankSet}(${odataGuid(recipientBankAccountRef)})?$format=json&$select=Ref_Key,Owner,Owner_Type,DeletionMark`,
+            );
+            if (
+              String(recipient["Ref_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== recipientBankAccountRef.toLowerCase()
+            )
+              throw new InputError(`Банковский счёт получателя ${recipientBankAccountRef} не найден.`);
+            if (recipient["DeletionMark"] === true)
+              throw new InputError("Банковский счёт получателя помечен на удаление.");
+            if (
+              String(recipient["Owner"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== counterpartyRef.toLowerCase()
+            )
+              throw new InputError("Банковский счёт получателя принадлежит другому контрагенту.");
+            if (
+              String(recipient["Owner_Type"] ?? "") !== "" &&
+              String(recipient["Owner_Type"] ?? "") !== counterpartyType
+            )
+              throw new InputError(
+                `Тип владельца банковского счёта получателя ${String(recipient["Owner_Type"] ?? "")} не совпадает с ${counterpartyType}.`,
+              );
+          }
+          const refs = [bankAccountingAccountRef, debitAccountRef].filter((r): r is string => Boolean(r));
+          if (refs.length) await accountsByRef(conn, [...new Set(refs)]);
+          if (subconto?.length) {
+            const available = await conn.available();
+            for (const item of subconto) {
+              const typeSet = item.type.replace(/^StandardODATA\./, "");
+              if (!available.has(typeSet))
+                throw new InputError(`Тип субконто ${item.type} не опубликован в OData.`);
+              const found = await conn.client.getEntity(
+                `${typeSet}(${odataGuid(item.ref)})?$format=json&$select=Ref_Key,DeletionMark`,
+              );
+              if (
+                String(found["Ref_Key"] ?? "")
+                  .replace(/[{}]/g, "")
+                  .toLowerCase() !== item.ref.toLowerCase()
+              )
+                throw new InputError(`Ссылка субконто ${item.ref} (${item.type}) не найдена.`);
+            }
+          }
+          const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
+          const docDate = new Date(`${date}T${time ?? "00:00:00"}`);
+          const incoming = incomingDate
+            ? odataDate(new Date(`${incomingDate}T${incomingTime ?? "00:00:00"}`))
+            : undefined;
+          const subcontoFields = Object.fromEntries(
+            (subconto ?? []).flatMap((item, index) => [
+              [`СубконтоДт${index + 1}`, item.ref],
+              [`СубконтоДт${index + 1}_Type`, item.type],
+            ]),
+          );
+          const payload = clean({
+            Date: odataDate(docDate),
+            Number: number.trim(),
+            Posted: false,
+            ВидОперации: operationKind,
+            Организация_Key: org.key,
+            СчетОрганизации_Key: bank,
+            ...(counterpartyRef && counterpartyType
+              ? { Контрагент: counterpartyRef, Контрагент_Type: counterpartyType }
+              : {}),
+            СчетБанк_Key: bankAccountingAccountRef,
+            СчетУчетаРасчетовСКонтрагентом_Key: debitAccountRef,
+            ...subcontoFields,
+            ...(recipientBankAccountRef ? { СчетКонтрагента_Key: recipientBankAccountRef } : {}),
+            НомерВходящегоДокумента: incomingNumber,
+            ДатаВходящегоДокумента: incoming,
+            СуммаДокумента: amount,
+            НазначениеПлатежа: purposeText,
+            СтатьяДвиженияДенежныхСредств_Key: cashflowItemRef,
+            Комментарий: comment,
+            РасшифровкаПлатежа: [],
+          });
+          const select = ["Ref_Key", "Number", "Date", "Организация_Key"];
+          const read = await fetchAll<ODataEntity>(
+            conn.client,
+            set,
+            {
+              filter: and(
+                cmp("Number", "eq", odataString(number.trim())),
+                cmp("Организация_Key", "eq", odataGuid(org.key)),
+              ),
+              select,
+            },
+            conn.behavior.pageSize,
+            5_000,
+          );
+          if (read.truncated)
+            throw new InputError("Проверка дубля списания: достигнут предел строк, проход неполный.");
+          const year = String(odataDate(docDate)).slice(0, 4);
+          const duplicate = read.rows.find((r) => String(r["Date"] ?? "").slice(0, 4) === year);
+          if (duplicate)
+            throw new InputError(
+              `Номер «${number}» уже занят документом ${String(duplicate["Ref_Key"] ?? "")} за ${year} год.`,
+            );
+          const created = await createOrPreview(conn, set, payload, confirm);
+          if (!confirm || created.isError) return created;
+          const createdData = created.structuredContent as Record<string, unknown> | undefined;
+          const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+          if (!ref) return created;
+          let actual: ODataEntity;
+          try {
+            actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+          } catch {
+            return {
+              ...created,
+              isError: true,
+              _meta: { "odata-1c/errorKind": "unknown" },
+              content: [
+                {
+                  type: "text",
+                  text: "Списание создано, но контрольное чтение не удалось; повтор запрещён.",
+                },
+              ],
+              structuredContent: { ...createdData, verification: "failed" },
+            };
+          }
+          const expected: Record<string, unknown> = {
+            Number: payload["Number"],
+            Date: payload["Date"],
+            Posted: false,
+            DeletionMark: false,
+            ВидОперации: operationKind,
+            Организация_Key: org.key,
+            СчетОрганизации_Key: bank,
+            ...(counterpartyRef && counterpartyType
+              ? { Контрагент: counterpartyRef, Контрагент_Type: counterpartyType }
+              : {}),
+            ...(bankAccountingAccountRef ? { СчетБанк_Key: bankAccountingAccountRef } : {}),
+            ...(debitAccountRef ? { СчетУчетаРасчетовСКонтрагентом_Key: debitAccountRef } : {}),
+            ...subcontoFields,
+            ...(recipientBankAccountRef ? { СчетКонтрагента_Key: recipientBankAccountRef } : {}),
+            ...(incomingNumber !== undefined ? { НомерВходящегоДокумента: incomingNumber } : {}),
+            ...(incoming !== undefined ? { ДатаВходящегоДокумента: incoming } : {}),
+            СуммаДокумента: amount,
+            ...(purposeText !== undefined ? { НазначениеПлатежа: purposeText } : {}),
+            ...(cashflowItemRef !== undefined ? { СтатьяДвиженияДенежныхСредств_Key: cashflowItemRef } : {}),
+            ...(comment !== undefined ? { Комментарий: comment } : {}),
+          };
+          const mismatch: string[] = [];
+          const types = new Map(
+            (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          for (const [field, value] of Object.entries(expected))
+            if (!sameStoredValue(value, actual[field], types.get(field) ?? "Edm.String"))
+              mismatch.push(field);
+          if (!Array.isArray(actual["РасшифровкаПлатежа"]) || actual["РасшифровкаПлатежа"].length !== 0)
+            mismatch.push("РасшифровкаПлатежа");
+          if (mismatch.length)
+            return {
+              ...created,
+              isError: true,
+              _meta: { "odata-1c/errorKind": "refused" },
+              content: [
+                {
+                  type: "text",
+                  text: `Списание создано (Ref_Key ${ref}), но контрольное чтение не подтвердило: ${mismatch.join(", ")}. Повтор запрещён.`,
+                },
+              ],
+              structuredContent: { ...createdData, verification: "failed", mismatches: mismatch },
+            };
+          return {
+            ...created,
+            structuredContent: {
+              ...(created.structuredContent as Record<string, unknown>),
+              verification: "ok",
+              verifiedFields: [...Object.keys(expected), "РасшифровкаПлатежа"],
+            },
+          };
+        }
         const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const bd = await buildSettlementRow(conn, operationKind, contractRef, amount);
         const payload = clean({

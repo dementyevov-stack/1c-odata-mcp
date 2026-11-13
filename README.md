@@ -305,7 +305,7 @@ Claude: (вызывает read.catalog.list_warehouses: розничные ск�
 | `write.sales.create_act` | Реализация услуг (акт) |
 | `write.sales.create_services_act` | Акт об оказании услуг (доходы/расходы по номенклатурной группе) |
 | `write.money.create_payment` / `write.money.create_payout_order` | Оплата от покупателя (поступление на р/с) / платёжное поручение |
-| `write.money.create_bank_writeoff` | Списание с расчётного счёта (исходящий платёж, вид операции обязателен) |
+| `write.money.create_bank_writeoff` | Списание с расчётного счёта (исходящий платёж, вид операции обязателен); opt-in историческая `КомиссияБанка`: точные Number/Date/входящие, счёт учёта, дебетовый счёт, субконто, ДДС, получатель с типизированным `Контрагент`/`Контрагент_Type` и проверкой владельца счёта, пустая расшифровка и GET |
 | `write.money.create_cash_receipt` / `write.money.create_cash_payment` | Приходный / расходный кассовый ордер (ПКО / РКО) |
 | `write.sales.create_issued_invoice` / `write.purchase.create_received_invoice` | Счёт-фактура выданный / полученный (на основании реализации / поступления) |
 | `write.entity.create_folder` / `write.entity.move_to_folder` | Папка (группа) справочника / перемещение в папку |

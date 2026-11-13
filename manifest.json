@@ -9996,6 +9996,76 @@
             "description": "Комментарий",
             "type": "string"
           },
+          "number": {
+            "description": "Исторический номер документа",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "time": {
+            "description": "Время документа",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "incomingNumber": {
+            "description": "Входящий номер",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "incomingDate": {
+            "description": "Входящая дата YYYY-MM-DD",
+            "type": "string"
+          },
+          "incomingTime": {
+            "description": "Входящее время",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "bankAccountingAccountRef": {
+            "description": "Счёт учёта банковского счёта (СчетБанк_Key)",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "debitAccountRef": {
+            "description": "Дебетовый счёт",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "subconto": {
+            "description": "Типизированное субконто Дт1..3",
+            "maxItems": 3,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ref": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Ref_Key субконто"
+                },
+                "type": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "Тип ссылки субконто"
+                }
+              },
+              "required": [
+                "ref",
+                "type"
+              ]
+            }
+          },
+          "recipientBankAccountRef": {
+            "description": "Банковский счёт получателя",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
           "confirm": {
             "default": false,
             "description": "false (по умолчанию) — только предпросмотр (dry-run), запись НЕ выполняется. true — выполнить создание. Сначала всегда показывайте dry-run и получайте согласие пользователя; при подтверждении передавайте operationId из результата предпросмотра и те же аргументы. После таймаута повторяйте подтверждение с тем же id, не создавая новый предпросмотр.",
