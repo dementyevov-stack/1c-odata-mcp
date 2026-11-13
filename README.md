@@ -303,7 +303,7 @@ Claude: (вызывает read.catalog.list_warehouses: розничные ск�
 | `write.warehouse.create_transfer` | Перемещение товаров между складами |
 | `write.warehouse.create_surplus` / `write.warehouse.create_writeoff` | Оприходование / списание товаров |
 | `write.warehouse.create_inventory` | Инвентаризация товаров на складе |
-| `write.sales.create_act` | Реализация услуг (акт) |
+| `write.sales.create_act` | Реализация услуг (акт); opt-in исторический номер/время, точный gross total, явные net/НДС/счета/группа/идентификатор строки, пустое количество без подстановки 1 и флаг `ЭтоУниверсальныйДокумент` (независимый `ВидЭлектронногоДокумента`), с readback |
 | `write.sales.create_services_act` | Акт об оказании услуг (доходы/расходы по номенклатурной группе) |
 | `write.money.create_payment` / `write.money.create_payout_order` | Оплата от покупателя (поступление на р/с) / платёжное поручение |
 | `write.money.create_payment_from_statement` | Первый участок загрузчика БП: оплата покупателя из строки выписки — организация, счёт, контрагент и договор по точным реквизитам, явные НДС/номер и дата входящего документа, dry-run и журнал `sourceKey → Ref_Key` — [подробнее](docs/BANK-LOADER.md) |

@@ -9621,7 +9621,7 @@
     {
       "name": "write.sales.create_act",
       "title": "Создать акт (реализация услуг)",
-      "description": "Создаёт «Реализация (акт, накладная)» с табличной частью УСЛУГИ (без склада/остатков). Документ НЕПРОВЕДЁННЫЙ; проводки при проведении Дт 62 Кт 90.01 (без 41; счёт расчётов — по настройке договора, источник виден в предпросмотре). ВАЖНО для услуг: задавайте content в строке — это «Содержание», текст, который печатается в акте и УПД (номер приложения, номер договора, период оказания). 1С его не заполнит. Счета доходов/расходов при необходимости задаются явно (напр. 90.01.2 / 90.02.2). dry-run/confirm. Контрагент — покупатель; позиции — услуги-номенклатура.",
+      "description": "Создаёт «Реализация (акт, накладная)» с табличной частью УСЛУГИ (без склада/остатков). Документ НЕПРОВЕДЁННЫЙ; проводки при проведении Дт 62 Кт 90.01 (без 41; счёт расчётов — по настройке договора, источник виден в предпросмотре). ВАЖНО для услуг: задавайте content в строке — это «Содержание», текст, который печатается в акте и УПД. Счета доходов/расходов при необходимости задаются явно. Исторический opt-in: собственный номер/время, явный gross total, цена/net/НДС/ставка, пустое количество (без подстановки 1), счета расчётов/авансов/доходов/расходов/НДС, типизированная номенклатурная группа, идентификатор строки и флаг УПД; с readback. dry-run/confirm. Контрагент — покупатель; позиции — услуги-номенклатура.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -9645,8 +9645,60 @@
             "description": "Дата YYYY-MM-DD (по умолчанию сегодня)",
             "type": "string"
           },
+          "number": {
+            "description": "Собственный номер документа",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "time": {
+            "description": "Точное время документа HH:MM:SS",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "comment": {
+            "description": "Явный комментарий шапки",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "documentTotal": {
+            "description": "Явный точный итог документа (gross)",
+            "type": "number",
+            "minimum": 0
+          },
+          "settlementAccountRef": {
+            "description": "Ref_Key счёта расчётов",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "advanceAccountRef": {
+            "description": "Ref_Key счёта авансов",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "orgBankAccount": {
+            "description": "Банковский счёт организации — печатается в документе как реквизиты для оплаты. Название/номер счёта (напр. «Сбербанк» или «40802…») либо Ref_Key. Без указания берётся ОСНОВНОЙ счёт организации.",
+            "type": "string"
+          },
+          "orgBankAccountEmpty": {
+            "description": "true — явно пустой счёт организации; не выбирать default",
+            "type": "boolean"
+          },
+          "universalDocument": {
+            "description": "ЭтоУниверсальныйДокумент: true/false; не подменяет тип электронного документа",
+            "type": "boolean"
+          },
+          "electronicDocumentType": {
+            "description": "ВидЭлектронногоДокумента — независимый тип; не выводится из universalDocument",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
           "operationKind": {
-            "description": "Вид операции (ВидОперации). Обычно НЕ задавайте: по умолчанию «Услуги» или значение из настройки базы (ODATA_ACCOUNTING_CONFIG, operationKinds.salesAct). Нужен, только если в конфигурации другое значение — не угадывайте.",
+            "description": "ВидОперации; обычно не задавайте",
             "type": "string",
             "minLength": 1,
             "maxLength": 100
@@ -9657,15 +9709,11 @@
             "type": "boolean"
           },
           "incomeAccount": {
-            "description": "Счёт доходов для ВСЕХ строк (напр. «90.01.2»); счёт в строке важнее",
+            "description": "Счёт доходов для всех строк",
             "type": "string"
           },
           "expenseAccount": {
-            "description": "Счёт расходов для ВСЕХ строк (напр. «90.02.2»); счёт в строке важнее",
-            "type": "string"
-          },
-          "orgBankAccount": {
-            "description": "Банковский счёт организации — печатается в документе как реквизиты для оплаты. Название/номер счёта (напр. «Сбербанк» или «40802…») либо Ref_Key. Без указания берётся ОСНОВНОЙ счёт организации.",
+            "description": "Счёт расходов для всех строк",
             "type": "string"
           },
           "lines": {
@@ -9679,9 +9727,9 @@
                   "description": "Ref_Key номенклатуры"
                 },
                 "quantity": {
+                  "description": "Количество; при emptyQuantity не задаётся",
                   "type": "number",
-                  "exclusiveMinimum": 0,
-                  "description": "Количество"
+                  "exclusiveMinimum": 0
                 },
                 "price": {
                   "type": "number",
@@ -9690,21 +9738,42 @@
                 },
                 "vatRate": {
                   "default": "БезНДС",
-                  "description": "Ставка НДС",
+                  "description": "Ставка НДС, включая исторические",
                   "type": "string",
                   "enum": [
                     "БезНДС",
                     "НДС0",
                     "НДС5",
+                    "НДС5_105",
                     "НДС7",
+                    "НДС7_107",
                     "НДС10",
+                    "НДС10_110",
+                    "НДС18",
+                    "НДС18_118",
                     "НДС20",
-                    "НДС22"
+                    "НДС20_120",
+                    "НДС22",
+                    "НДС22_122"
                   ]
                 },
                 "content": {
                   "description": "Содержание строки (реквизит «Содержание») — именно этот текст печатается в счёте и УПД. Для услуг заполняйте обязательно, напр. «Услуги согласно приложению № 4 от 01.10.2025 г. к договору № 87 от 01.12.2023 г. за июль 2026 г.». 1С сама это поле НЕ заполняет.",
                   "type": "string"
+                },
+                "emptyQuantity": {
+                  "description": "Opt-in: количество в источнике пустое; поле не отправляется",
+                  "type": "boolean"
+                },
+                "amount": {
+                  "description": "Явная net-сумма строки",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "vatAmount": {
+                  "description": "Явная сумма НДС строки",
+                  "type": "number",
+                  "minimum": 0
                 },
                 "incomeAccount": {
                   "description": "Счёт доходов — код плана счетов как в 1С (напр. «90.01.1» или «90.01.2») либо Ref_Key счёта. Без указания берётся из регистра «Счета учёта номенклатуры», иначе 90.01.1.",
@@ -9713,11 +9782,46 @@
                 "expenseAccount": {
                   "description": "Счёт расходов (себестоимости) — код как в 1С (напр. «90.02.1» или «90.02.2») либо Ref_Key. Без указания берётся из регистра «Счета учёта номенклатуры», иначе 90.02.1.",
                   "type": "string"
+                },
+                "incomeAccountRef": {
+                  "description": "Ref_Key счёта доходов (явно)",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "expenseAccountRef": {
+                  "description": "Ref_Key счёта расходов (явно)",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "vatAccountRef": {
+                  "description": "Ref_Key счёта учёта НДС по реализации",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "accountingGroupRef": {
+                  "description": "Ref_Key номенклатурной группы (Субконто)",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "accountingGroupType": {
+                  "description": "Тип Субконто; по умолчанию StandardODATA.Catalog_НоменклатурныеГруппы",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "sourceLineId": {
+                  "description": "ИдентификаторСтроки источника",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
                 }
               },
               "required": [
                 "nomenclatureRef",
-                "quantity",
                 "price"
               ]
             },

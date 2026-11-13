@@ -3940,6 +3940,46 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       }),
   );
 
+  const historicalServiceLine = z
+    .object({
+      ...baseLineShape,
+      quantity: z.number().positive().optional().describe("Количество; при emptyQuantity не задаётся"),
+      emptyQuantity: z
+        .boolean()
+        .optional()
+        .describe("Opt-in: количество в источнике пустое; поле не отправляется"),
+      vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические"),
+      amount: z.number().nonnegative().optional().describe("Явная net-сумма строки"),
+      vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
+      incomeAccount: incomeAccountField,
+      expenseAccount: expenseAccountField,
+      incomeAccountRef: z.string().uuid().optional().describe("Ref_Key счёта доходов (явно)"),
+      expenseAccountRef: z.string().uuid().optional().describe("Ref_Key счёта расходов (явно)"),
+      vatAccountRef: z.string().uuid().optional().describe("Ref_Key счёта учёта НДС по реализации"),
+      accountingGroupRef: z.string().uuid().optional().describe("Ref_Key номенклатурной группы (Субконто)"),
+      accountingGroupType: z
+        .string()
+        .trim()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe("Тип Субконто; по умолчанию StandardODATA.Catalog_НоменклатурныеГруппы"),
+      sourceLineId: z.string().trim().min(1).max(200).optional().describe("ИдентификаторСтроки источника"),
+    })
+    .superRefine((line, ctx) => {
+      if (line.emptyQuantity) {
+        if (line.quantity !== undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity нельзя сочетать с quantity." });
+        if (line.amount === undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity требует явную amount." });
+        if (line.vatAmount === undefined)
+          ctx.addIssue({ code: "custom", message: "emptyQuantity требует явный vatAmount." });
+        return;
+      }
+      if (line.quantity === undefined)
+        ctx.addIssue({ code: "custom", message: "quantity обязателен или задайте emptyQuantity=true." });
+    });
+
   server.registerTool(
     "write.sales.create_act",
     {
@@ -3948,8 +3988,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "Создаёт «Реализация (акт, накладная)» с табличной частью УСЛУГИ (без склада/остатков). " +
         "Документ НЕПРОВЕДЁННЫЙ; проводки при проведении Дт 62 Кт 90.01 (без 41; счёт расчётов — по настройке договора, источник виден в предпросмотре). " +
         "ВАЖНО для услуг: задавайте content в строке — это «Содержание», текст, который печатается " +
-        "в акте и УПД (номер приложения, номер договора, период оказания). 1С его не заполнит. " +
-        "Счета доходов/расходов при необходимости задаются явно (напр. 90.01.2 / 90.02.2). " +
+        "в акте и УПД. Счета доходов/расходов при необходимости задаются явно. " +
+        "Исторический opt-in: собственный номер/время, явный gross total, цена/net/НДС/ставка, " +
+        "пустое количество (без подстановки 1), счета расчётов/авансов/доходов/расходов/НДС, " +
+        "типизированная номенклатурная группа, идентификатор строки и флаг УПД; с readback. " +
         "dry-run/confirm. Контрагент — покупатель; позиции — услуги-номенклатура.",
       inputSchema: z.object({
         database: databaseField,
@@ -3957,25 +3999,43 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         counterpartyRef: z.string().describe("Ref_Key покупателя"),
         contractRef: z.string().optional().describe("Ref_Key договора"),
         date: z.string().optional().describe("Дата YYYY-MM-DD (по умолчанию сегодня)"),
+        number: z.string().trim().min(1).max(100).optional().describe("Собственный номер документа"),
+        time: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Точное время документа HH:MM:SS"),
+        comment: z.string().trim().min(1).max(1000).optional().describe("Явный комментарий шапки"),
+        documentTotal: z.number().nonnegative().optional().describe("Явный точный итог документа (gross)"),
+        settlementAccountRef: z.string().uuid().optional().describe("Ref_Key счёта расчётов"),
+        advanceAccountRef: z.string().uuid().optional().describe("Ref_Key счёта авансов"),
+        orgBankAccount: orgBankAccountField,
+        orgBankAccountEmpty: z
+          .boolean()
+          .optional()
+          .describe("true — явно пустой счёт организации; не выбирать default"),
+        universalDocument: z
+          .boolean()
+          .optional()
+          .describe("ЭтоУниверсальныйДокумент: true/false; не подменяет тип электронного документа"),
+        electronicDocumentType: z
+          .string()
+          .trim()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe("ВидЭлектронногоДокумента — независимый тип; не выводится из universalDocument"),
         operationKind: z
           .string()
           .trim()
           .min(1)
           .max(100)
           .optional()
-          .describe(
-            "Вид операции (ВидОперации). Обычно НЕ задавайте: по умолчанию «Услуги» или значение из настройки базы " +
-              "(ODATA_ACCOUNTING_CONFIG, operationKinds.salesAct). Нужен, только если в конфигурации другое значение — не угадывайте.",
-          ),
+          .describe("ВидОперации; обычно не задавайте"),
         sumIncludesVat: z.boolean().default(true).describe("Сумма включает НДС"),
-        incomeAccount: incomeAccountField.describe(
-          "Счёт доходов для ВСЕХ строк (напр. «90.01.2»); счёт в строке важнее",
-        ),
-        expenseAccount: expenseAccountField.describe(
-          "Счёт расходов для ВСЕХ строк (напр. «90.02.2»); счёт в строке важнее",
-        ),
-        orgBankAccount: orgBankAccountField,
-        lines: z.array(lineObject).min(1).describe("Позиции-услуги"),
+        incomeAccount: incomeAccountField.describe("Счёт доходов для всех строк"),
+        expenseAccount: expenseAccountField.describe("Счёт расходов для всех строк"),
+        lines: z.array(historicalServiceLine).min(1).describe("Позиции-услуги"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
@@ -3986,11 +4046,20 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       counterpartyRef,
       contractRef,
       date,
+      number,
+      time,
+      comment,
+      documentTotal,
+      settlementAccountRef,
+      advanceAccountRef,
+      orgBankAccount,
+      orgBankAccountEmpty,
+      universalDocument,
+      electronicDocumentType,
       operationKind,
       sumIncludesVat,
       incomeAccount,
       expenseAccount,
-      orgBankAccount,
       lines,
       confirm,
     }) =>
@@ -3998,26 +4067,390 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const conn = ctx.db(database);
         const set = await requireEntity(conn, WRITE_DOCUMENTS.sales, "Документ «Реализация товаров и услуг»");
         const org = await resolveOrg(conn, organization);
-        const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
-        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "service", {
-          income: incomeAccount,
-          expense: expenseAccount,
+        const props = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        const rowProps = new Map(
+          (await conn.getMetadata()).entities.get(`${set}_Услуги`)?.properties.map((p) => [p.name, p.type]) ??
+            [],
+        );
+        const historical =
+          number !== undefined ||
+          time !== undefined ||
+          comment !== undefined ||
+          documentTotal !== undefined ||
+          settlementAccountRef !== undefined ||
+          advanceAccountRef !== undefined ||
+          orgBankAccountEmpty === true ||
+          universalDocument !== undefined ||
+          electronicDocumentType !== undefined ||
+          lines.some(
+            (line) =>
+              line.emptyQuantity === true ||
+              line.amount !== undefined ||
+              line.vatAmount !== undefined ||
+              line.incomeAccountRef !== undefined ||
+              line.expenseAccountRef !== undefined ||
+              line.vatAccountRef !== undefined ||
+              line.accountingGroupRef !== undefined ||
+              line.sourceLineId !== undefined ||
+              !(VAT_RATES as readonly string[]).includes(line.vatRate ?? "БезНДС"),
+          );
+        const emptyQuantity = lines.some((line) => line.emptyQuantity === true);
+        const need = (field: string, type: string): void => {
+          if (props.get(field) !== type)
+            throw new InputError(
+              `Схема документа не публикует ${field} с типом ${type}; историческое поле перенести нельзя.`,
+            );
+        };
+        const needRow = (field: string, type: string): void => {
+          if (rowProps.get(field) !== type)
+            throw new InputError(
+              `Схема услуги не публикует ${field} с типом ${type}; историческое поле перенести нельзя.`,
+            );
+        };
+
+        const accounts = (refs: string[]): Promise<void> =>
+          (async () => {
+            try {
+              await accountsByRef(conn, [...new Set(refs.filter(Boolean))]);
+            } catch {
+              throw new InputError(`Счёт из явной ссылки не найден в плане счетов: ${refs.join(", ")}.`);
+            }
+          })();
+        if (historical) {
+          need("Date", "Edm.DateTime");
+          need("СуммаДокумента", "Edm.Double");
+          need("СуммаВключаетНДС", "Edm.Boolean");
+          need("Posted", "Edm.Boolean");
+          need("DeletionMark", "Edm.Boolean");
+          need("ВидОперации", "Edm.String");
+          needRow("Номенклатура_Key", "Edm.Guid");
+          needRow("Сумма", "Edm.Double");
+          needRow("Цена", "Edm.Double");
+          if (!contractRef) throw new InputError("Исторический акт требует явный contractRef.");
+          await resolveCustomerContract(conn, { orgKey: org.key, counterpartyRef, contractRef });
+          if (orgBankAccount && orgBankAccountEmpty)
+            throw new InputError("orgBankAccount и orgBankAccountEmpty взаимоисключающие.");
+          if (!orgBankAccount && !orgBankAccountEmpty)
+            throw new InputError(
+              "Исторический акт: задайте Ref_Key банковского счёта или orgBankAccountEmpty=true.",
+            );
+          if (orgBankAccount && !GUID_RE.test(orgBankAccount))
+            throw new InputError("Исторический акт: банковский счёт должен быть Ref_Key.");
+          if (orgBankAccount) {
+            const bankSet = resolveEntity(CATALOGS.bankAccounts, await conn.available());
+            if (!bankSet) throw new InputError("Справочник «Банковские счета» не опубликован.");
+            try {
+              const bankDoc = await conn.client.getEntity(
+                `${bankSet}(${odataGuid(orgBankAccount)})?$format=json&$select=Ref_Key,Owner`,
+              );
+              if (
+                String(bankDoc["Owner"] ?? "")
+                  .replace(/[{}]/g, "")
+                  .toLowerCase() !== org.key.toLowerCase()
+              )
+                throw new InputError("Исторический акт: банковский счёт принадлежит не этой организации.");
+            } catch (error) {
+              if (error instanceof ODataError && error.kind === "not_found")
+                throw new InputError(`Банковский счёт ${orgBankAccount} не найден.`);
+              throw error;
+            }
+          }
+          if (time !== undefined) need("Date", "Edm.DateTime");
+          if (number !== undefined) need("Number", "Edm.String");
+          if (comment !== undefined) need("Комментарий", "Edm.String");
+          if (universalDocument !== undefined) need("ЭтоУниверсальныйДокумент", "Edm.Boolean");
+          if (electronicDocumentType !== undefined) need("ВидЭлектронногоДокумента", "Edm.String");
+          if (settlementAccountRef !== undefined) need("СчетУчетаРасчетовСКонтрагентом_Key", "Edm.Guid");
+          if (advanceAccountRef !== undefined) need("СчетУчетаРасчетовПоАвансам_Key", "Edm.Guid");
+          needRow("СчетДоходов_Key", "Edm.Guid");
+          needRow("СчетРасходов_Key", "Edm.Guid");
+          needRow("СчетУчетаНДСПоРеализации_Key", "Edm.Guid");
+          if (lines.some((l) => l.sourceLineId !== undefined)) needRow("ИдентификаторСтроки", "Edm.String");
+          if (lines.some((l) => l.accountingGroupRef !== undefined)) {
+            needRow("Субконто", "Edm.String");
+            needRow("Субконто_Type", "Edm.String");
+          }
+          if (emptyQuantity) {
+            // Количество не отправляется: проверяем только, что поле вообще опубликовано.
+            needRow("Количество", "Edm.Double");
+          }
+          const refs = [
+            settlementAccountRef,
+            advanceAccountRef,
+            ...lines.flatMap((l) => [l.incomeAccountRef, l.expenseAccountRef, l.vatAccountRef]),
+          ].filter((r): r is string => Boolean(r));
+          if (refs.length) await accounts(refs);
+          if (lines.some((l) => l.accountingGroupRef !== undefined)) {
+            const grpSet = resolveEntity(CATALOGS.nomenclatureGroups, await conn.available());
+            if (!grpSet)
+              throw new InputError("Номенклатурные группы не опубликованы — Субконто не типизировать.");
+            for (const line of lines) {
+              if (line.accountingGroupRef) {
+                try {
+                  const grp = await conn.client.getEntity(
+                    `${grpSet}(${odataGuid(line.accountingGroupRef)})?$format=json&$select=Ref_Key,DeletionMark`,
+                  );
+                  if (grp.DeletionMark === true)
+                    throw new InputError("Номенклатурная группа помечена на удаление.");
+                  const expectedType = `StandardODATA.${grpSet}`;
+                  if (line.accountingGroupType && line.accountingGroupType !== expectedType)
+                    throw new InputError(
+                      `Тип Субконто ${line.accountingGroupType} не совпадает с ${expectedType}.`,
+                    );
+                } catch (error) {
+                  if (error instanceof ODataError && error.kind === "not_found")
+                    throw new InputError(`Номенклатурная группа ${line.accountingGroupRef} не найдена.`);
+                  throw error;
+                }
+              }
+            }
+          }
+        }
+        const bank = orgBankAccountEmpty
+          ? undefined
+          : await resolveOrgBankAccount(conn, org.key, orgBankAccount);
+        const { settlement, lineAccountsFor } = await goodsAccounts(
+          conn,
+          org.key,
+          lines as GoodsLine[],
+          "service",
+          {
+            income: incomeAccount,
+            expense: expenseAccount,
+          },
+        );
+        const rows = lines.map((l, i) => {
+          const defaultAccounts = lineAccountsFor(l as GoodsLine);
+          return clean({
+            ...(l.sourceLineId !== undefined ? { ИдентификаторСтроки: l.sourceLineId } : {}),
+            ...(l.accountingGroupRef !== undefined
+              ? {
+                  Субконто: l.accountingGroupRef,
+                  Субконто_Type: l.accountingGroupType ?? "StandardODATA.Catalog_НоменклатурныеГруппы",
+                }
+              : {}),
+            LineNumber: i + 1,
+            Номенклатура_Key: l.nomenclatureRef,
+            ...(l.content === undefined ? {} : { Содержание: l.content }),
+            ...(l.emptyQuantity ? {} : { Количество: l.quantity }),
+            Цена: l.price,
+            ...(l.amount !== undefined
+              ? { Сумма: l.amount }
+              : l.emptyQuantity
+                ? {}
+                : { Сумма: lineSum(l as GoodsLine) }),
+            ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
+            СтавкаНДС: l.vatRate,
+            СчетДоходов_Key: l.incomeAccountRef ?? defaultAccounts["СчетДоходов_Key"],
+            СчетРасходов_Key: l.expenseAccountRef ?? defaultAccounts["СчетРасходов_Key"],
+            СчетУчетаНДСПоРеализации_Key: l.vatAccountRef ?? defaultAccounts["СчетУчетаНДСПоРеализации_Key"],
+          });
         });
-        const rows = buildGoodsRows(lines, lineAccountsFor);
+        const netTotal =
+          Math.round(rows.reduce((sum, row) => sum + Number(row["Сумма"] ?? 0), 0) * 100) / 100;
+        const vatTotal =
+          Math.round(rows.reduce((sum, row) => sum + Number(row["СуммаНДС"] ?? 0), 0) * 100) / 100;
+        const calculatedTotal =
+          historical && !sumIncludesVat ? Math.round((netTotal + vatTotal) * 100) / 100 : netTotal;
+        const now = new Date();
+        const day = date ?? odataDate(now).slice(0, 10);
+        const documentDate = time ? new Date(`${day}T${time}`) : date ? new Date(`${date}T00:00:00`) : now;
+        if (number) {
+          const documentNumber = number.trim();
+          const select = ["Ref_Key", "Number", "Date", "Организация_Key"];
+          const sameNumber = (r: ODataEntity): boolean =>
+            String(r["Организация_Key"] ?? "")
+              .replace(/[{}]/g, "")
+              .toLowerCase() === org.key.toLowerCase() && String(r["Number"] ?? "").trim() === documentNumber;
+          let found: ODataEntity[];
+          let truncated: boolean;
+          try {
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              {
+                filter: and(
+                  cmp("Number", "eq", odataString(documentNumber)),
+                  cmp("Организация_Key", "eq", odataGuid(org.key)),
+                ),
+                select,
+              },
+              conn.behavior.pageSize,
+              200,
+            );
+            found = read.rows;
+            truncated = read.truncated;
+          } catch (error) {
+            if (!(error instanceof ODataError && error.status === 500)) throw error;
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              { select },
+              conn.behavior.pageSize,
+              5_000,
+            );
+            found = read.rows;
+            truncated = read.truncated;
+          }
+          if (truncated)
+            throw new InputError("Проверка номера акта: достигнут предел строк, проход неполный.");
+          const year = String(odataDate(documentDate)).slice(0, 4);
+          const conflict = found.find((r) => sameNumber(r) && String(r["Date"] ?? "").slice(0, 4) === year);
+          if (conflict)
+            throw new InputError(
+              `Номер «${documentNumber}» уже занят документом ${String(conflict["Ref_Key"] ?? "")} за ${year} год.`,
+            );
+        }
         const payload = clean({
-          Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
+          Date: odataDate(documentDate),
+          ...(number ? { Number: number.trim() } : {}),
           Posted: false,
           ВидОперации: configuredOperationKind(conn.cfg, "salesAct", operationKind),
           Организация_Key: org.key,
           Контрагент_Key: counterpartyRef,
           ДоговорКонтрагента_Key: contractRef,
-          СчетУчетаРасчетовСКонтрагентом_Key: settlement,
-          БанковскийСчетОрганизации_Key: bank,
+          ...(comment !== undefined ? { Комментарий: comment } : {}),
+          ...(settlementAccountRef
+            ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef }
+            : { СчетУчетаРасчетовСКонтрагентом_Key: settlement }),
+          ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
+          ...(orgBankAccountEmpty
+            ? { БанковскийСчетОрганизации_Key: EMPTY_GUID }
+            : bank
+              ? { БанковскийСчетОрганизации_Key: bank }
+              : {}),
+          ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
+          ...(electronicDocumentType !== undefined
+            ? { ВидЭлектронногоДокумента: electronicDocumentType }
+            : {}),
           СуммаВключаетНДС: sumIncludesVat,
-          СуммаДокумента: rowsTotal(rows),
+          СуммаДокумента: documentTotal ?? calculatedTotal,
           Услуги: rows,
         });
-        return createOrPreview(conn, set, payload, confirm);
+        let effectivePayload = payload;
+        const created = await createOrPreview(conn, set, payload, confirm, undefined, {
+          prepared: (prepared) => {
+            effectivePayload = prepared;
+          },
+        });
+        if (!historical || !confirm || created.isError) {
+          if (historical && !confirm)
+            return withStructured(created, {
+              ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
+              ...(emptyQuantity
+                ? {
+                    quantityNote:
+                      "Количество не отправлено; представление пустого количества ждёт live-проверки.",
+                  }
+                : {}),
+              ...(universalDocument !== undefined ? { universalDocument } : {}),
+            });
+          return created;
+        }
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+        if (!ref) return created;
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch {
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              { type: "text", text: "Акт создан, но контрольное чтение не удалось; повтор запрещён." },
+            ],
+            structuredContent: { ...createdData, verification: "failed" },
+          };
+        }
+        const expectedHeader: Record<string, unknown> = {
+          Date: effectivePayload["Date"],
+          ...(number ? { Number: effectivePayload["Number"] } : {}),
+          ...(comment !== undefined ? { Комментарий: effectivePayload["Комментарий"] } : {}),
+          Организация_Key: org.key,
+          Контрагент_Key: counterpartyRef,
+          ДоговорКонтрагента_Key: effectivePayload["ДоговорКонтрагента_Key"],
+          ...(settlementAccountRef ? { СчетУчетаРасчетовСКонтрагентом_Key: settlementAccountRef } : {}),
+          ...(advanceAccountRef ? { СчетУчетаРасчетовПоАвансам_Key: advanceAccountRef } : {}),
+          ...(orgBankAccountEmpty
+            ? { БанковскийСчетОрганизации_Key: EMPTY_GUID }
+            : bank
+              ? { БанковскийСчетОрганизации_Key: bank }
+              : {}),
+          Posted: false,
+          DeletionMark: false,
+          ВидОперации: effectivePayload["ВидОперации"],
+          ...(universalDocument !== undefined ? { ЭтоУниверсальныйДокумент: universalDocument } : {}),
+          ...(electronicDocumentType !== undefined
+            ? { ВидЭлектронногоДокумента: electronicDocumentType }
+            : {}),
+          СуммаВключаетНДС: sumIncludesVat,
+          СуммаДокумента: effectivePayload["СуммаДокумента"],
+        };
+        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
+        const headerTypes = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        for (const [field, value] of Object.entries(expectedHeader))
+          if (!sameStoredValue(value, actual[field], headerTypes.get(field) ?? "Edm.String"))
+            mismatches.push({ field, expected: value, actual: actual[field] });
+        const actualRows = actual["Услуги"];
+        if (!Array.isArray(actualRows) || actualRows.length !== rows.length)
+          mismatches.push({
+            field: "Услуги",
+            expected: `строк: ${rows.length}`,
+            actual: Array.isArray(actualRows) ? `строк: ${actualRows.length}` : "нет таблицы",
+          });
+        else {
+          const rowTypes = new Map(
+            (await conn.getMetadata()).entities
+              .get(`${set}_Услуги`)
+              ?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          rows.forEach((expected, index) => {
+            const actualRow = actualRows[index] as Record<string, unknown>;
+            for (const [field, value] of Object.entries(expected)) {
+              if (!sameStoredValue(value, actualRow[field], rowTypes.get(field) ?? "Edm.String"))
+                mismatches.push({
+                  field: `Услуги[${index + 1}].${field}`,
+                  expected: value,
+                  actual: actualRow[field],
+                });
+            }
+          });
+        }
+        if (mismatches.length)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Акт создан (Ref_Key ${ref}), но контрольное чтение не подтвердило: ` +
+                  `${mismatches.map((m) => m.field).join(", ")}. Повтор запрещён.`,
+              },
+            ],
+            structuredContent: {
+              ...createdData,
+              verification: "failed",
+              mismatches,
+              ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
+            },
+          };
+        return withStructured(created, {
+          verification: "ok",
+          ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
+          ...(universalDocument !== undefined ? { universalDocument } : {}),
+          verifiedFields: [
+            ...Object.keys(expectedHeader),
+            ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Услуги[${i + 1}].${field}`)),
+          ],
+        });
       }),
   );
 
