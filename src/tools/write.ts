@@ -447,19 +447,25 @@ export function buildGoodsRows(
   );
 }
 
+type InvoiceLine = Omit<GoodsLine, "quantity"> & {
+  quantity?: number | undefined;
+  emptyQuantity?: boolean | undefined;
+};
+
 /** Строки «Товары» для счёта покупателю (полиморфная ссылка Номенклатура+_Type). */
-export function buildInvoiceRows(lines: GoodsLine[]): Array<Record<string, unknown>> {
+export function buildInvoiceRows(lines: InvoiceLine[]): Array<Record<string, unknown>> {
   return lines.map((l, i) =>
     clean({
-      ...carriedRowFields(l),
+      ...carriedRowFields(l as GoodsLine),
       LineNumber: i + 1,
       Номенклатура: l.nomenclatureRef,
       Номенклатура_Type: NOMENCLATURE_TYPE,
       // Только когда задано: иначе затёрли бы содержание, перенесённое из исходной строки.
       ...(l.content === undefined ? {} : { Содержание: l.content }),
-      Количество: l.quantity,
+      // Opt-in пустого количества: поле не сериализуется вообще, сумма обязательна.
+      ...(l.emptyQuantity ? {} : { Количество: l.quantity }),
       Цена: l.price,
-      Сумма: l.amount ?? lineSum(l),
+      Сумма: l.amount ?? (l.emptyQuantity ? undefined : lineSum(l as GoodsLine)),
       СтавкаНДС: l.vatRate,
       ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
     }),
@@ -1119,12 +1125,37 @@ const saleLine = z.object({
 const purchaseLine = z.object(baseLineShape);
 
 /** Историческая строка счёта: расширенные ставки НДС, явная сумма и сумма налога. */
-const historicalInvoiceLine = z.object({
-  ...baseLineShape,
-  vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические значения"),
-  amount: z.number().nonnegative().optional().describe("Явная сумма строки (если не quantity × price)"),
-  vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
-});
+const historicalInvoiceLine = z
+  .object({
+    ...baseLineShape,
+    quantity: z.number().positive().optional().describe("Количество; при emptyQuantity не задаётся"),
+    emptyQuantity: z
+      .boolean()
+      .optional()
+      .describe("Opt-in: количество в источнике пустое; поле вообще не отправляется"),
+    vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические значения"),
+    amount: z.number().nonnegative().optional().describe("Явная сумма строки (если не quantity × price)"),
+    vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
+  })
+  .superRefine((line, ctx) => {
+    if (line.emptyQuantity) {
+      if (line.quantity !== undefined)
+        ctx.addIssue({
+          code: "custom",
+          message: "emptyQuantity нельзя сочетать с quantity: количество должно остаться пустым.",
+        });
+      if (line.amount === undefined)
+        ctx.addIssue({ code: "custom", message: "emptyQuantity требует явную amount." });
+      if (line.vatAmount === undefined)
+        ctx.addIssue({ code: "custom", message: "emptyQuantity требует явный vatAmount." });
+      return;
+    }
+    if (line.quantity === undefined)
+      ctx.addIssue({
+        code: "custom",
+        message: "quantity обязателен; для пустого количества используйте emptyQuantity=true.",
+      });
+  });
 
 /** Убирает undefined-поля, чтобы не слать их в 1С. */
 function clean(obj: Record<string, unknown>): Record<string, unknown> {
@@ -2541,10 +2572,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           comment !== undefined ||
           lines.some(
             (line) =>
+              line.emptyQuantity === true ||
               line.amount !== undefined ||
               line.vatAmount !== undefined ||
               !(VAT_RATES as readonly string[]).includes(line.vatRate ?? "БезНДС"),
           );
+        const emptyQuantity = lines.some((line) => line.emptyQuantity === true);
         if (historical) {
           if (!contractRef)
             throw new InputError("Исторический счёт требует явный contractRef; договор не подставляется.");
@@ -2571,6 +2604,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         }
         const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const rows = buildInvoiceRows(lines);
+        const netTotal = rowsTotal(rows);
+        const vatTotal =
+          Math.round(rows.reduce((sum, row) => sum + Number(row["СуммаНДС"] ?? 0), 0) * 100) / 100;
+        // Историческая строка с sumIncludesVat=false хранит net-сумму, а итог документа — gross.
+        const documentTotal =
+          historical && !sumIncludesVat ? Math.round((netTotal + vatTotal) * 100) / 100 : netTotal;
         const now = new Date();
         const day = date ?? odataDate(now).slice(0, 10);
         const documentDate = time ? new Date(`${day}T${time}`) : date ? new Date(`${date}T00:00:00`) : now;
@@ -2635,7 +2674,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           СтруктурнаяЕдиница_Key: bank,
           ...(comment !== undefined ? { Комментарий: comment } : {}),
           СуммаВключаетНДС: sumIncludesVat,
-          СуммаДокумента: rowsTotal(rows),
+          СуммаДокумента: documentTotal,
           Товары: rows,
         });
         let effectivePayload = payload;
@@ -2644,7 +2683,19 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             effectivePayload = prepared;
           },
         });
-        if (!historical || !confirm || created.isError) return created;
+        if (!historical || !confirm || created.isError) {
+          if (historical && !confirm)
+            return withStructured(created, {
+              ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
+              ...(emptyQuantity
+                ? {
+                    quantityNote:
+                      "Количество в источнике пустое; поле не отправлено. Точное представление пустого количества в OData ждёт live-проверки.",
+                  }
+                : {}),
+            });
+          return created;
+        }
         const createdData = created.structuredContent as Record<string, unknown> | undefined;
         const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
         if (!ref) return created;
@@ -2730,6 +2781,13 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           };
         return withStructured(created, {
           verification: "ok",
+          ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
+          ...(emptyQuantity
+            ? {
+                quantityNote:
+                  "Количество не отправлено и не сверялось: представление пустого количества в OData ещё не подтверждено live-проверкой.",
+              }
+            : {}),
           verifiedFields: [
             ...Object.keys(expectedHeader),
             ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Товары[${i + 1}].${field}`)),

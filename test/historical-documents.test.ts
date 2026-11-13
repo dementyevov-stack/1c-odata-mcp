@@ -174,6 +174,92 @@ describe("write.sales.create_invoice: исторические opt-in поля",
     expect(postCount(fake)).toBe(1);
   });
 
+  it("sumIncludesVat=false: исторический итог документа включает net и НДС", async () => {
+    const { client, fake } = await setup();
+    const net = {
+      ...invoiceArgs,
+      sumIncludesVat: false,
+      lines: [
+        {
+          nomenclatureRef: NOM,
+          quantity: 1,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          content: "Услуга net",
+        },
+      ],
+    };
+    const preview = await call(client, "write.sales.create_invoice", { ...net, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({ СуммаВключаетНДС: false, СуммаДокумента: 120 });
+    expect((payload["Товары"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      Сумма: 100,
+      СуммаНДС: 20,
+    });
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("emptyQuantity: preview не сериализует Количество и помечает readback pending", async () => {
+    const { client, fake } = await setup();
+    const emptyArgs = {
+      ...invoiceArgs,
+      lines: [
+        {
+          nomenclatureRef: NOM,
+          emptyQuantity: true,
+          price: 1000,
+          amount: 1000,
+          vatRate: "НДС18",
+          vatAmount: 180,
+          content: "Услуга без количества",
+        },
+      ],
+    };
+    const preview = await call(client, "write.sales.create_invoice", { ...emptyArgs, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    const row = (payload["Товары"] as Array<Record<string, unknown>>)[0]!;
+    expect(Object.prototype.hasOwnProperty.call(row, "Количество")).toBe(false);
+    expect(row).toMatchObject({
+      Цена: 1000,
+      Сумма: 1000,
+      СтавкаНДС: "НДС18",
+      СуммаНДС: 180,
+      Содержание: "Услуга без количества",
+    });
+    expect(preview.structuredContent?.quantityVerification).toBe("pending_live_validation");
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("emptyQuantity требует amount/vatAmount и не сочетается с quantity", async () => {
+    const { client, fake } = await setup();
+    const missing = await call(client, "write.sales.create_invoice", {
+      ...invoiceArgs,
+      lines: [{ nomenclatureRef: NOM, emptyQuantity: true, price: 1000 }],
+      confirm: false,
+    });
+    expect(missing.isError).toBe(true);
+    const both = await call(client, "write.sales.create_invoice", {
+      ...invoiceArgs,
+      lines: [
+        {
+          nomenclatureRef: NOM,
+          quantity: 1,
+          emptyQuantity: true,
+          price: 1000,
+          amount: 1000,
+          vatAmount: 180,
+        },
+      ],
+      confirm: false,
+    });
+    expect(both.isError).toBe(true);
+    expect(postCount(fake)).toBe(0);
+  });
+
   it("ловит конфликт номера в том же году и разрешает тот же номер в другом", async () => {
     const { client, fake } = await setup({
       invoices: [{ Ref_Key: DOC, Number: "INV-1", Date: "2026-05-01T00:00:00", Организация_Key: ORG }],

@@ -6813,9 +6813,9 @@
                   "description": "Ref_Key номенклатуры"
                 },
                 "quantity": {
+                  "description": "Количество; при emptyQuantity не задаётся",
                   "type": "number",
-                  "exclusiveMinimum": 0,
-                  "description": "Количество"
+                  "exclusiveMinimum": 0
                 },
                 "price": {
                   "type": "number",
@@ -6847,6 +6847,10 @@
                   "description": "Содержание строки (реквизит «Содержание») — именно этот текст печатается в счёте и УПД. Для услуг заполняйте обязательно, напр. «Услуги согласно приложению № 4 от 01.10.2025 г. к договору № 87 от 01.12.2023 г. за июль 2026 г.». 1С сама это поле НЕ заполняет.",
                   "type": "string"
                 },
+                "emptyQuantity": {
+                  "description": "Opt-in: количество в источнике пустое; поле вообще не отправляется",
+                  "type": "boolean"
+                },
                 "amount": {
                   "description": "Явная сумма строки (если не quantity × price)",
                   "type": "number",
@@ -6860,7 +6864,6 @@
               },
               "required": [
                 "nomenclatureRef",
-                "quantity",
                 "price"
               ]
             },
