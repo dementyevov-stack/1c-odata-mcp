@@ -117,6 +117,20 @@ const CONTRACT_KINDS = ["СПокупателем", "СПоставщиком", 
 /** Ставки НДС (Enum_СтавкиНДС), подмножество ходовых. */
 const VAT_RATES = ["БезНДС", "НДС0", "НДС5", "НДС7", "НДС10", "НДС20", "НДС22"] as const;
 
+/** Значения Enum_ВидыСтавокНДС из проверенной схемы БП 3.0. */
+const VAT_KIND_VALUES = [
+  "БезНДС",
+  "Нулевая",
+  "Общая",
+  "ОбщаяРасчетная",
+  "ОбщаяУСН",
+  "ОбщаяУСНРасчетная",
+  "Пониженная",
+  "ПониженнаяРасчетная",
+  "ПониженнаяУСН",
+  "ПониженнаяУСНРасчетная",
+] as const;
+
 /**
  * Ставки НДС для переноса явных исторических значений из банковской выписки. Список — из
  * Enum_СтавкиНДС БП 3.0, включая ставки до 2019 года и расчётные; неизвестное значение
@@ -358,6 +372,10 @@ export interface GoodsLine {
   expenseAccount?: string | undefined;
   /** Исходная строка документа (при правке существующего) — чтобы не терять её поля. */
   source?: Record<string, unknown> | undefined;
+  /** Историческая сумма строки (если нельзя/не нужно считать quantity × price). */
+  amount?: number | undefined;
+  /** Явная историческая сумма НДС строки. */
+  vatAmount?: number | undefined;
 }
 type LineAccountsFor = (line: GoodsLine) => Record<string, string>;
 
@@ -429,20 +447,27 @@ export function buildGoodsRows(
   );
 }
 
+type InvoiceLine = Omit<GoodsLine, "quantity"> & {
+  quantity?: number | undefined;
+  emptyQuantity?: boolean | undefined;
+};
+
 /** Строки «Товары» для счёта покупателю (полиморфная ссылка Номенклатура+_Type). */
-export function buildInvoiceRows(lines: GoodsLine[]): Array<Record<string, unknown>> {
+export function buildInvoiceRows(lines: InvoiceLine[]): Array<Record<string, unknown>> {
   return lines.map((l, i) =>
     clean({
-      ...carriedRowFields(l),
+      ...carriedRowFields(l as GoodsLine),
       LineNumber: i + 1,
       Номенклатура: l.nomenclatureRef,
       Номенклатура_Type: NOMENCLATURE_TYPE,
       // Только когда задано: иначе затёрли бы содержание, перенесённое из исходной строки.
       ...(l.content === undefined ? {} : { Содержание: l.content }),
-      Количество: l.quantity,
+      // Opt-in пустого количества: поле не сериализуется вообще, сумма обязательна.
+      ...(l.emptyQuantity ? {} : { Количество: l.quantity }),
       Цена: l.price,
-      Сумма: lineSum(l),
+      Сумма: l.amount ?? (l.emptyQuantity ? undefined : lineSum(l as GoodsLine)),
       СтавкаНДС: l.vatRate,
+      ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
     }),
   );
 }
@@ -1098,6 +1123,39 @@ const saleLine = z.object({
 
 /** Позиция документа закупки: счета доходов/расходов неприменимы. */
 const purchaseLine = z.object(baseLineShape);
+
+/** Историческая строка счёта: расширенные ставки НДС, явная сумма и сумма налога. */
+const historicalInvoiceLine = z
+  .object({
+    ...baseLineShape,
+    quantity: z.number().positive().optional().describe("Количество; при emptyQuantity не задаётся"),
+    emptyQuantity: z
+      .boolean()
+      .optional()
+      .describe("Opt-in: количество в источнике пустое; поле вообще не отправляется"),
+    vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические значения"),
+    amount: z.number().nonnegative().optional().describe("Явная сумма строки (если не quantity × price)"),
+    vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
+  })
+  .superRefine((line, ctx) => {
+    if (line.emptyQuantity) {
+      if (line.quantity !== undefined)
+        ctx.addIssue({
+          code: "custom",
+          message: "emptyQuantity нельзя сочетать с quantity: количество должно остаться пустым.",
+        });
+      if (line.amount === undefined)
+        ctx.addIssue({ code: "custom", message: "emptyQuantity требует явную amount." });
+      if (line.vatAmount === undefined)
+        ctx.addIssue({ code: "custom", message: "emptyQuantity требует явный vatAmount." });
+      return;
+    }
+    if (line.quantity === undefined)
+      ctx.addIssue({
+        code: "custom",
+        message: "quantity обязателен; для пустого количества используйте emptyQuantity=true.",
+      });
+  });
 
 /** Убирает undefined-поля, чтобы не слать их в 1С. */
 function clean(obj: Record<string, unknown>): Record<string, unknown> {
@@ -2135,13 +2193,34 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "Создаёт новую позицию номенклатуры (товар/услуга). ПО УМОЛЧАНИЮ предпросмотр (dry-run): " +
         "покажите пользователю payload и только после согласия повторите с confirm=true. " +
         "Можно указать артикул, папку (folder — имя группы или Ref_Key) и пометить услугой (isService). " +
+        "Исторические opt-in поля: собственный Code, вид номенклатуры, единица, номенклатурная группа " +
+        "и ВидСтавкиНДС; при их наличии проверяются публикация, существование целей, дубль Code и readback. " +
         "Запись идёт в боевую базу.",
       inputSchema: z.object({
         database: databaseField,
         name: z.string().min(1).describe("Наименование номенклатуры (Description)"),
         fullName: z.string().optional().describe("Полное наименование"),
         article: z.string().optional().describe("Артикул"),
+        code: z.string().trim().min(1).max(100).optional().describe("Исторический Code номенклатуры"),
         folder: z.string().optional().describe("Папка/группа — имя или Ref_Key (для размещения в группе)"),
+        groupRef: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("Ref_Key номенклатурной группы (НоменклатурнаяГруппа_Key)"),
+        serviceKindRef: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("Ref_Key вида номенклатуры (ВидНоменклатуры_Key)"),
+        unitRef: z.string().uuid().optional().describe("Ref_Key единицы измерения (ЕдиницаИзмерения_Key)"),
+        vatKind: z
+          .string()
+          .trim()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("ВидСтавкиНДС: БезНДС, Нулевая, Общая, ОбщаяРасчетная, Пониженная…"),
         isService: z
           .boolean()
           .default(false)
@@ -2150,19 +2229,193 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       }),
       outputSchema: createResultSchema,
     },
-    ({ database, name, fullName, article, folder, isService, confirm }) =>
+    ({
+      database,
+      name,
+      fullName,
+      article,
+      code,
+      folder,
+      groupRef,
+      serviceKindRef,
+      unitRef,
+      vatKind,
+      isService,
+      confirm,
+    }) =>
       guard("write.catalog.create_nomenclature", async () => {
         const conn = ctx.db(database);
         const set = await resolveSet(conn, CATALOGS.nomenclature, "Номенклатура");
+        const props = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        const historical =
+          code !== undefined ||
+          groupRef !== undefined ||
+          serviceKindRef !== undefined ||
+          unitRef !== undefined ||
+          vatKind !== undefined;
+        const need = (field: string, type: string): void => {
+          if (props.get(field) !== type)
+            throw new InputError(
+              `Схема номенклатуры не публикует ${field} с типом ${type}; историческое поле перенести нельзя.`,
+            );
+        };
+        const existingTarget = async (candidates: readonly string[], ref: string, label: string) => {
+          const targetSet = resolveEntity(candidates, await conn.available());
+          if (!targetSet) throw new InputError(`${label} не опубликован в OData.`);
+          try {
+            const target = await conn.client.getEntity(
+              `${targetSet}(${odataGuid(ref)})?$format=json&$select=Ref_Key,DeletionMark`,
+            );
+            if (String(target.Ref_Key).toLowerCase() !== ref.toLowerCase())
+              throw new InputError(`${label}: 1С вернула другой объект.`);
+            if (target.DeletionMark === true) throw new InputError(`${label} помечен на удаление.`);
+          } catch (error) {
+            if (error instanceof ODataError && error.kind === "not_found")
+              throw new InputError(`${label} с Ref_Key ${ref} не найден.`);
+            throw error;
+          }
+        };
+        if (historical) {
+          if (code !== undefined) need("Code", "Edm.String");
+          if (groupRef !== undefined) need("НоменклатурнаяГруппа_Key", "Edm.Guid");
+          if (serviceKindRef !== undefined) need("ВидНоменклатуры_Key", "Edm.Guid");
+          if (unitRef !== undefined) need("ЕдиницаИзмерения_Key", "Edm.Guid");
+          if (vatKind !== undefined) {
+            need("ВидСтавкиНДС", "Edm.String");
+            if (!(VAT_KIND_VALUES as readonly string[]).includes(vatKind))
+              throw new InputError(
+                `ВидСтавкиНДС «${vatKind}» не входит в проверенное перечисление. ` +
+                  `Допустимые: ${VAT_KIND_VALUES.join(", ")}.`,
+              );
+          }
+          if (groupRef) await existingTarget(CATALOGS.nomenclatureGroups, groupRef, "Номенклатурная группа");
+          if (serviceKindRef)
+            await existingTarget(["Catalog_ВидыНоменклатуры"], serviceKindRef, "Вид номенклатуры");
+          if (unitRef) {
+            const meta = await conn.getMetadata();
+            const navigation = meta.entities
+              .get("Catalog_Номенклатура")
+              ?.navigations.find((n) => n.name === "ЕдиницаИзмерения");
+            const unitCandidates = [
+              navigation?.toType,
+              "Catalog_КлассификаторЕдиницИзмерения",
+              "Catalog_ЕдиницыИзмерения",
+            ].filter((name): name is string => Boolean(name));
+            await existingTarget(unitCandidates, unitRef, "Единица измерения");
+          }
+          if (code !== undefined) {
+            const select = ["Ref_Key", "Code", "Description"];
+            let rows: ODataEntity[];
+            let truncated: boolean;
+            try {
+              const read = await fetchAll<ODataEntity>(
+                conn.client,
+                set,
+                { filter: cmp("Code", "eq", odataString(code)), select },
+                conn.behavior.pageSize,
+                200,
+              );
+              rows = read.rows;
+              truncated = read.truncated;
+            } catch (error) {
+              if (!(error instanceof ODataError && error.status === 500)) throw error;
+              const read = await fetchAll<ODataEntity>(
+                conn.client,
+                set,
+                { select },
+                conn.behavior.pageSize,
+                5_000,
+              );
+              rows = read.rows;
+              truncated = read.truncated;
+            }
+            if (truncated)
+              throw new InputError(
+                "Проверка кода номенклатуры: достигнут предел строк, проход неполный; " +
+                  "нельзя утверждать, что код свободен.",
+              );
+            const conflict = rows.find((r) => String(r["Code"] ?? "").trim() === code);
+            if (conflict)
+              throw new InputError(
+                `Код номенклатуры «${code}» уже занят: ${String(conflict["Description"] ?? "")} ` +
+                  `(${String(conflict["Ref_Key"] ?? "")}).`,
+              );
+          }
+        }
         const parentRef = await folderRefOf(conn, set, folder);
         const payload = clean({
           Description: name,
           НаименованиеПолное: fullName,
           Артикул: article,
+          Code: code,
           Parent_Key: parentRef,
+          НоменклатурнаяГруппа_Key: groupRef,
+          ВидНоменклатуры_Key: serviceKindRef,
+          ЕдиницаИзмерения_Key: unitRef,
+          ВидСтавкиНДС: vatKind,
           ...(isService ? { Услуга: true } : {}),
         });
-        return createOrPreview(conn, set, payload, confirm);
+        const created = await createOrPreview(conn, set, payload, confirm);
+        if (!historical || !confirm || created.isError) return created;
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+        if (!ref) return created;
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Номенклатура создана (Ref_Key ${ref}), но перечитать её не удалось: ${reason}. ` +
+                  "Повторная запись заблокирована; проверьте объект в 1С вручную.",
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed" },
+          };
+        }
+        const expected: Record<string, unknown> = {
+          Description: name,
+          ...(fullName !== undefined ? { НаименованиеПолное: fullName } : {}),
+          ...(article !== undefined ? { Артикул: article } : {}),
+          ...(code !== undefined ? { Code: code } : {}),
+          ...(groupRef !== undefined ? { НоменклатурнаяГруппа_Key: groupRef } : {}),
+          ...(serviceKindRef !== undefined ? { ВидНоменклатуры_Key: serviceKindRef } : {}),
+          ...(unitRef !== undefined ? { ЕдиницаИзмерения_Key: unitRef } : {}),
+          ...(vatKind !== undefined ? { ВидСтавкиНДС: vatKind } : {}),
+          ...(isService ? { Услуга: true } : {}),
+        };
+        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
+        for (const [field, value] of Object.entries(expected))
+          if (!sameStoredValue(value, actual[field], props.get(field) ?? "Edm.String"))
+            mismatches.push({ field, expected: value, actual: actual[field] });
+        if (mismatches.length)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Номенклатура создана (Ref_Key ${ref}), но контрольное чтение не подтвердило поля: ` +
+                  `${mismatches.map((m) => m.field).join(", ")}. Повторная запись заблокирована.`,
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed", mismatches },
+          };
+        return withStructured(created, {
+          verification: "ok",
+          verifiedFields: Object.keys(expected),
+        });
       }),
   );
 
@@ -2267,17 +2520,26 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "Документ создаётся НЕПРОВЕДЁННЫМ (черновик) — провести можно вручную в 1С или инструментом post_document. " +
         "Для услуг задавайте content в строке — это «Содержание», именно оно печатается в счёте. " +
         "По умолчанию предпросмотр (dry-run); создание — при confirm=true. " +
-        "Контрагент и (опц.) договор — по Ref_Key; позиции — по Ref_Key номенклатуры.",
+        "Исторические opt-in поля: собственный номер и точное время, явная сумма/НДС строки и расширенные ставки НДС; " +
+        "при их наличии выполняется точное контрольное чтение. Пустое количество и срок оплаты пока не поддержаны. " +
+        "Контрагент и договор — по Ref_Key; позиции — по Ref_Key номенклатуры.",
       inputSchema: z.object({
         database: databaseField,
         organization: organizationField,
         counterpartyRef: z.string().describe("Ref_Key контрагента-покупателя"),
-        contractRef: z.string().optional().describe("Ref_Key договора (необязательно)"),
+        contractRef: z.string().optional().describe("Ref_Key договора (для исторического режима обязателен)"),
         date: z.string().optional().describe("Дата документа YYYY-MM-DD (по умолчанию сегодня)"),
+        number: z.string().trim().min(1).max(100).optional().describe("Собственный номер документа"),
+        time: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Точное время документа HH:MM:SS (по умолчанию 00:00:00)"),
+        comment: z.string().trim().min(1).max(1000).optional().describe("Явный комментарий шапки"),
         sumIncludesVat: z.boolean().default(true).describe("Сумма включает НДС"),
         orgBankAccount: orgBankAccountField,
         // Счёт на оплату проводок не делает — счета учёта в его строках не нужны.
-        lines: z.array(purchaseLine).min(1).describe("Позиции счёта"),
+        lines: z.array(historicalInvoiceLine).min(1).describe("Позиции счёта"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
@@ -2288,6 +2550,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       counterpartyRef,
       contractRef,
       date,
+      number,
+      time,
+      comment,
       sumIncludesVat,
       orgBankAccount,
       lines,
@@ -2301,21 +2566,233 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           "Документ «Счёт на оплату покупателю»",
         );
         const org = await resolveOrg(conn, organization);
+        const historical =
+          number !== undefined ||
+          time !== undefined ||
+          comment !== undefined ||
+          lines.some(
+            (line) =>
+              line.emptyQuantity === true ||
+              line.amount !== undefined ||
+              line.vatAmount !== undefined ||
+              !(VAT_RATES as readonly string[]).includes(line.vatRate ?? "БезНДС"),
+          );
+        const emptyQuantity = lines.some((line) => line.emptyQuantity === true);
+        if (historical) {
+          if (!contractRef)
+            throw new InputError("Исторический счёт требует явный contractRef; договор не подставляется.");
+          if (!orgBankAccount || !GUID_RE.test(orgBankAccount))
+            throw new InputError("Исторический счёт требует явный Ref_Key банковского счёта организации.");
+          await resolveCustomerContract(conn, { orgKey: org.key, counterpartyRef, contractRef });
+          const bankSet = resolveEntity(CATALOGS.bankAccounts, await conn.available());
+          if (!bankSet) throw new InputError("Справочник «Банковские счета» не опубликован.");
+          try {
+            const bankDoc = await conn.client.getEntity(
+              `${bankSet}(${odataGuid(orgBankAccount)})?$format=json&$select=Ref_Key,Owner`,
+            );
+            if (
+              String(bankDoc["Owner"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() !== org.key.toLowerCase()
+            )
+              throw new InputError("Исторический счёт: банковский счёт принадлежит не этой организации.");
+          } catch (error) {
+            if (error instanceof ODataError && error.kind === "not_found")
+              throw new InputError(`Банковский счёт ${orgBankAccount} не найден.`);
+            throw error;
+          }
+        }
         const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const rows = buildInvoiceRows(lines);
+        const netTotal = rowsTotal(rows);
+        const vatTotal =
+          Math.round(rows.reduce((sum, row) => sum + Number(row["СуммаНДС"] ?? 0), 0) * 100) / 100;
+        // Историческая строка с sumIncludesVat=false хранит net-сумму, а итог документа — gross.
+        const documentTotal =
+          historical && !sumIncludesVat ? Math.round((netTotal + vatTotal) * 100) / 100 : netTotal;
+        const now = new Date();
+        const day = date ?? odataDate(now).slice(0, 10);
+        const documentDate = time ? new Date(`${day}T${time}`) : date ? new Date(`${date}T00:00:00`) : now;
+        if (number) {
+          const documentNumber = number.trim();
+          const select = ["Ref_Key", "Number", "Date", "Организация_Key"];
+          const sameNumber = (r: ODataEntity): boolean =>
+            String(r["Организация_Key"] ?? "")
+              .replace(/[{}]/g, "")
+              .toLowerCase() === org.key.toLowerCase() && String(r["Number"] ?? "").trim() === documentNumber;
+          let found: ODataEntity[];
+          let truncated: boolean;
+          try {
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              {
+                filter: and(
+                  cmp("Number", "eq", odataString(documentNumber)),
+                  cmp("Организация_Key", "eq", odataGuid(org.key)),
+                ),
+                select,
+              },
+              conn.behavior.pageSize,
+              200,
+            );
+            found = read.rows;
+            truncated = read.truncated;
+          } catch (error) {
+            if (!(error instanceof ODataError && error.status === 500)) throw error;
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              { select },
+              conn.behavior.pageSize,
+              5_000,
+            );
+            found = read.rows;
+            truncated = read.truncated;
+          }
+          if (truncated)
+            throw new InputError(
+              "Проверка номера счёта: достигнут предел строк, проход неполный. " +
+                "Нельзя утверждать, что номер свободен; увеличьте ODATA_MAX_ROWS.",
+            );
+          const year = String(odataDate(documentDate)).slice(0, 4);
+          const conflict = found.find((r) => sameNumber(r) && String(r["Date"] ?? "").slice(0, 4) === year);
+          if (conflict)
+            throw new InputError(
+              `Номер «${documentNumber}» уже занят счётом ${String(conflict["Ref_Key"] ?? "")} ` +
+                `за ${year} год у этой организации.`,
+            );
+        }
         const payload = clean({
-          Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
+          Date: odataDate(documentDate),
+          ...(number ? { Number: number.trim() } : {}),
           Posted: false,
           Организация_Key: org.key,
           Контрагент_Key: counterpartyRef,
           ДоговорКонтрагента_Key: contractRef,
           // У счёта на оплату банковский счёт организации зовётся «Структурная единица».
           СтруктурнаяЕдиница_Key: bank,
+          ...(comment !== undefined ? { Комментарий: comment } : {}),
           СуммаВключаетНДС: sumIncludesVat,
-          СуммаДокумента: rowsTotal(rows),
+          СуммаДокумента: documentTotal,
           Товары: rows,
         });
-        return createOrPreview(conn, set, payload, confirm);
+        let effectivePayload = payload;
+        const created = await createOrPreview(conn, set, payload, confirm, undefined, {
+          prepared: (prepared) => {
+            effectivePayload = prepared;
+          },
+        });
+        if (!historical || !confirm || created.isError) {
+          if (historical && !confirm)
+            return withStructured(created, {
+              ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
+              ...(emptyQuantity
+                ? {
+                    quantityNote:
+                      "Количество в источнике пустое; поле не отправлено. Точное представление пустого количества в OData ждёт live-проверки.",
+                  }
+                : {}),
+            });
+          return created;
+        }
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+        if (!ref) return created;
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Счёт создан (Ref_Key ${ref}), но перечитать его не удалось: ${reason}. ` +
+                  "Повторная запись заблокирована; проверьте документ в 1С вручную.",
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed" },
+          };
+        }
+        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
+        const expectedHeader: Record<string, unknown> = {
+          Date: effectivePayload["Date"],
+          ...(number ? { Number: effectivePayload["Number"] } : {}),
+          ...(comment !== undefined ? { Комментарий: effectivePayload["Комментарий"] } : {}),
+          Организация_Key: org.key,
+          Контрагент_Key: counterpartyRef,
+          ДоговорКонтрагента_Key: effectivePayload["ДоговорКонтрагента_Key"],
+          СтруктурнаяЕдиница_Key: effectivePayload["СтруктурнаяЕдиница_Key"],
+          СуммаВключаетНДС: sumIncludesVat,
+          СуммаДокумента: effectivePayload["СуммаДокумента"],
+        };
+        const headerTypes = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        for (const [field, value] of Object.entries(expectedHeader))
+          if (!sameStoredValue(value, actual[field], headerTypes.get(field) ?? "Edm.String"))
+            mismatches.push({ field, expected: value, actual: actual[field] });
+        const actualRows = actual["Товары"];
+        if (!Array.isArray(actualRows) || actualRows.length !== rows.length)
+          mismatches.push({
+            field: "Товары",
+            expected: `строк: ${rows.length}`,
+            actual: Array.isArray(actualRows) ? `строк: ${actualRows.length}` : "нет таблицы",
+          });
+        else {
+          const rowTypes = new Map(
+            (await conn.getMetadata()).entities
+              .get(`${set}_Товары`)
+              ?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          rows.forEach((expected, index) => {
+            const actualRow = actualRows[index] as Record<string, unknown>;
+            for (const [field, value] of Object.entries(expected)) {
+              if (field === "Номенклатура_Type") continue;
+              if (!sameStoredValue(value, actualRow[field], rowTypes.get(field) ?? "Edm.String"))
+                mismatches.push({
+                  field: `Товары[${index + 1}].${field}`,
+                  expected: value,
+                  actual: actualRow[field],
+                });
+            }
+          });
+        }
+        if (mismatches.length)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Счёт создан (Ref_Key ${ref}), но контрольное чтение не подтвердило поля: ` +
+                  `${mismatches.map((m) => m.field).join(", ")}. Повторная запись заблокирована; ` +
+                  "проверьте документ в 1С вручную.",
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed", mismatches },
+          };
+        return withStructured(created, {
+          verification: "ok",
+          ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
+          ...(emptyQuantity
+            ? {
+                quantityNote:
+                  "Количество не отправлено и не сверялось: представление пустого количества в OData ещё не подтверждено live-проверкой.",
+              }
+            : {}),
+          verifiedFields: [
+            ...Object.keys(expectedHeader),
+            ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Товары[${i + 1}].${field}`)),
+          ],
+        });
       }),
   );
 
