@@ -1,0 +1,98 @@
+{
+  "contractVersion": "1.0",
+  "status": "synthetic_prototype_not_compiled",
+  "purpose": "Transfer one manual BP operation with header and accounting-register movements, preserving Posted/Active and typed subconto.",
+  "document": {
+    "entity": "Document_ОперацияБух",
+    "posted": false,
+    "requiredHeaderFields": [
+      "Number",
+      "Date",
+      "Организация_Key",
+      "СуммаОперации",
+      "Содержание",
+      "Комментарий"
+    ]
+  },
+  "idempotency": {
+    "key": "sourceKey",
+    "scope": ["organization", "documentNumber", "year"],
+    "marker": "[migration:%s]",
+    "duplicateAction": "return_existing",
+    "duplicateChecks": ["sourceKey", "number+organization+year"]
+  },
+  "transaction": {
+    "atomic": ["documentHeader", "accountingRegisterMovements"],
+    "rollbackOn": [
+      "reference_missing_or_deleted",
+      "subconto_type_mismatch",
+      "subconto_reference_mismatch",
+      "amount_mismatch",
+      "readback_mismatch"
+    ],
+    "locks": ["document", "registerRegistrar"]
+  },
+  "movements": {
+    "register": "AccountingRegister_Хозрасчетный",
+    "registrarType": "Document_ОперацияБух",
+    "oneRegistrar": true,
+    "rowFields": [
+      "LineNumber",
+      "Period",
+      "Active",
+      "AccountDr_Key",
+      "AccountCr_Key",
+      "Сумма",
+      "СубконтоДт1",
+      "СубконтоДт1_Type",
+      "СубконтоДт2",
+      "СубконтоДт2_Type",
+      "СубконтоДт3",
+      "СубконтоДт3_Type",
+      "СубконтоКт1",
+      "СубконтоКт1_Type",
+      "СубконтоКт2",
+      "СубконтоКт2_Type",
+      "СубконтоКт3",
+      "СубконтоКт3_Type",
+      "СуммаНУДт",
+      "СуммаНУКт",
+      "СуммаПРДт",
+      "СуммаПРКт",
+      "СуммаВРДт",
+      "СуммаВРКт"
+    ],
+    "emptyAmountPolicy": "Only explicitly supplied values; no defaults for tax/analytic fields.",
+    "activePolicy": "Copy Active per row; Posted is copied from the header, not inferred."
+  },
+  "validation": {
+    "references": "exists, not marked for deletion, type exactly matches the declared subconto type",
+    "subconto": "for every used slot, both reference and type are required; empty slots stay empty",
+    "amounts": "line amount, debit/credit equality and all supplied tax amounts are compared exactly; empty remains empty",
+    "readback": "re-read document and all register rows by registrar; compare every supplied field before commit"
+  },
+  "testScenario": {
+    "name": "rollback_on_subconto_type_mismatch",
+    "steps": [
+      "write synthetic header and one movement in a transaction",
+      "tamper one subconto type before readback",
+      "readback must detect mismatch",
+      "transaction must roll back: no document, no register rows"
+    ],
+    "expected": {
+      "documentCreated": false,
+      "movementCount": 0,
+      "rollback": true
+    }
+  },
+  "standardInterface": {
+    "preferred": "Document_ОперацияБух via standard 1C object API, if its published object has a posting/movement table that writes an unposted document",
+    "fallback": "Not allowed without an owner-approved standard API; no direct DB writes.",
+    "conditions": [
+      "external processing is enabled in the target infobase",
+      "safe mode allows required object writes",
+      "the test infobase has the same platform/configuration version",
+      "the operation object and accounting register are published/available to the processing"
+    ]
+  }
+}
