@@ -566,7 +566,7 @@ describe("подготовка оплаты покупателя", () => {
     await journal.release();
   });
 
-  it("lock погибшего процесса снимается после прерывания", async () => {
+  it("существующий lock не снимается автоматически; восстановление — ручное", async () => {
     const dir = await mkdtemp(join(tmpdir(), "bank-loader-stale-"));
     cleanup.push(() => rm(dir, { recursive: true, force: true }));
     await writeFile(
@@ -574,8 +574,22 @@ describe("подготовка оплаты покупателя", () => {
       JSON.stringify({ pid: 9999999, host: "other-host", startedAt: new Date(0).toISOString() }),
     );
     const journal = new BankLoadJournal(dir);
+    await expect(journal.acquire()).rejects.toThrow("вручную");
+    await rm(join(dir, "journal.lock"), { force: true });
     await journal.acquire();
     await journal.release();
+  });
+
+  it("release не удаляет чужой lock", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bank-loader-foreign-lock-"));
+    cleanup.push(() => rm(dir, { recursive: true, force: true }));
+    const owner = new BankLoadJournal(dir);
+    const contender = new BankLoadJournal(dir);
+    await owner.acquire();
+    await expect(contender.acquire()).rejects.toThrow("уже используется");
+    await contender.release();
+    await expect(new BankLoadJournal(dir).acquire()).rejects.toThrow("уже используется");
+    await owner.release();
   });
 
   it("журнал предыдущей версии не считается изменённым источником", async () => {
