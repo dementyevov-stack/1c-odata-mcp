@@ -264,7 +264,11 @@ export async function findBankAccountsByOwnerAndNumber(
     throw new InputError(
       "Справочник «Банковские счета» не публикует владельца «Owner» — нельзя отличить счёт организации.",
     );
-  const select = ["Ref_Key", "Description", "НомерСчета", "Owner", "DeletionMark"].filter(
+  if (expectedOwnerType && !props.has("Owner_Type"))
+    throw new InputError(
+      "Справочник «Банковские счета» не публикует «Owner_Type» — нельзя отличить счёт организации от счёта контрагента.",
+    );
+  const select = ["Ref_Key", "Description", "НомерСчета", "Owner", "Owner_Type", "DeletionMark"].filter(
     (f) => f === "Ref_Key" || props.has(f),
   );
   const maxRows = Math.min(conn.behavior.maxRows, REQUISITES_SCAN_MAX);

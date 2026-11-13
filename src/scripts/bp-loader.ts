@@ -58,6 +58,8 @@ function parseArgs(argv: readonly string[]): Options {
   }
   if (["prepare", "load", "resume"].includes(command) && !options.source)
     throw new Error(`${command} требует --source <файл> с пакетом строк выписки.`);
+  if (command === "prepare" && options.confirm)
+    throw new Error("prepare — только предпросмотр; для записи используйте load --confirm.");
   return options;
 }
 

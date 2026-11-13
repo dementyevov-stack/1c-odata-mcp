@@ -753,13 +753,13 @@ async function runOne(
     }
   }
 
-  if (mode === "confirm" && preparedState?.state !== "prepared")
+  if (options.confirm && preparedState?.state !== "prepared")
     return {
       sourceKey: source.sourceKey,
       action: "blocked",
       note:
-        "Нет проверенного плана: load/resume с --confirm подтверждает только строку, " +
-        "для которой ранее выполнен prepare. В 1С ничего не записано.",
+        "Нет проверенного плана: подтверждение возможно только для строки, для которой ранее " +
+        "выполнен prepare. В 1С ничего не записано.",
     };
 
   const reuse =

@@ -87,6 +87,7 @@ interface FixtureOptions {
   contracts?: Record<string, unknown>[];
   bankAccounts?: Record<string, unknown>[];
   dropPostResponse?: boolean;
+  respectSelect?: boolean;
 }
 
 async function fixture(options: FixtureOptions = {}) {
@@ -132,7 +133,11 @@ async function fixture(options: FixtureOptions = {}) {
       ODATA_WRITABLE: "true",
       ODATA_WRITE_JOURNAL_DIR: writeDir,
     },
-    { data, ...(options.dropPostResponse ? { dropPostResponse: true } : {}) },
+    {
+      data,
+      ...(options.dropPostResponse ? { dropPostResponse: true } : {}),
+      ...(options.respectSelect ? { respectSelect: true } : {}),
+    },
   );
   const server = createServer(fake.ctx);
   const [a, b] = InMemoryTransport.createLinkedPair();
@@ -262,6 +267,13 @@ describe("подготовка оплаты покупателя", () => {
       НомерВходящегоДокумента: "BANK-77",
       ДатаВходящегоДокумента: "2026-10-31T00:00:00",
     });
+    expect(postCount(fake)).toBe(0);
+  });
+
+  it("prepare с confirm не является обходом: подтверждение без плана отклоняется", async () => {
+    const { client, fake, journal } = await fixture();
+    const run = await runPackage(client, target, [source], journal, { confirm: true, mode: "prepare" });
+    expect(run.documents[0]?.action).toBe("blocked");
     expect(postCount(fake)).toBe(0);
   });
 
@@ -466,6 +478,18 @@ describe("банковский счёт организации", () => {
     expect(report.status).toBe("blocked");
     expect(report.blocker).toContain("bankBik");
     expect(report.minimalFix).toContain("target.bankBik");
+  });
+
+  it("при настоящем $select запрашивает Owner_Type и всё равно находит счёт организации", async () => {
+    const { client, fake } = await fixture({ respectSelect: true });
+    const found = (await client.callTool({
+      name: ACCOUNT_FIND_TOOL,
+      arguments: { organization: ORG, accountNumber: ACCOUNT_NUMBER },
+    })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+    expect(found.isError, JSON.stringify(found)).toBeFalsy();
+    expect(found.structuredContent).toMatchObject({ found: true, account: { ref: ACC } });
+    const query = fake.requests.find((r) => r.resource === "Catalog_БанковскиеСчета")?.query ?? "";
+    expect(query).toContain("Owner_Type");
   });
 
   it("создаёт счёт именно организации, а повторно находит его без записи", async () => {

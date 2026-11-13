@@ -244,6 +244,8 @@ export interface FakeOptions {
   data?: (q: FakeQuery) => Record<string, unknown>[] | undefined;
   /** POST создаёт объект в подделке, но ответ теряется — проверка неизвестного исхода. */
   dropPostResponse?: boolean;
+  /** Как настоящая 1С, возвращать только поля из $select (для проверки, что _Type не забыт). */
+  respectSelect?: boolean;
 }
 
 /** Параметры функции «Имя=значение,…»: запятая и скобка внутри кавычек — часть значения, '' — кавычка. */
@@ -273,6 +275,16 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
     const [pathPart = "", query = ""] = raw.split("?");
     const path = decodeURIComponent(pathPart);
     const params = new URLSearchParams(query);
+    const selected = options.respectSelect
+      ? (params.get("$select") ?? "")
+          .split(",")
+          .map((f) => f.trim())
+          .filter(Boolean)
+      : undefined;
+    const project = (row: Record<string, unknown>): Record<string, unknown> =>
+      selected?.length
+        ? Object.fromEntries(Object.entries(row).filter(([field]) => selected.includes(field)))
+        : row;
     if (path === "$metadata")
       return new Response(SCHEMAS[schema].xml, {
         status: 200,
@@ -392,7 +404,7 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
       const merged = [...own, ...createdRows.filter((row) => !own.includes(row))];
       const skip = Number(params.get("$skip") ?? 0);
       const top = params.has("$top") ? Number(params.get("$top")) : merged.length;
-      return json(200, { value: merged.slice(skip, skip + top) });
+      return json(200, { value: merged.slice(skip, skip + top).map(project) });
     }
     if (virtual) {
       const row = syntheticRow(virtual, base, schema);
@@ -401,7 +413,7 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
     }
     if (keyed) {
       const created = createdState.get(path);
-      if (created) return json(200, created);
+      if (created) return json(200, project(created));
     }
     if (Number(params.get("$skip") ?? 0) > 0 && !keyed) return json(200, { value: [] });
     if (base.startsWith("ChartOfAccounts_") && !keyed)
@@ -431,7 +443,10 @@ export function fake1C(env: Record<string, string> = {}, options: FakeOptions = 
         row[m[1]!] = m[2] ?? m[4] ?? m[3]!.replace(/''/g, "'");
         if (m[5] && `${m[1]}_Type` in row) row[`${m[1]}_Type`] = `StandardODATA.${m[5]}`;
       }
-    return json(200, keyed ? row : { value: createdRows.length ? createdRows : [row] });
+    return json(
+      200,
+      keyed ? project(row) : { value: (createdRows.length ? createdRows : [row]).map(project) },
+    );
   };
 
   vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
