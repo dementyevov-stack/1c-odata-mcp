@@ -3122,6 +3122,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         settlementAccountRef: z.string().uuid().optional().describe("Ref_Key счёта расчётов (60.01)"),
         advanceAccountRef: z.string().uuid().optional().describe("Ref_Key счёта авансов (60.02)"),
         universalDocument: z.boolean().optional().describe("ЭтоУниверсальныйДокумент"),
+        allowGenericContractKind: z
+          .boolean()
+          .optional()
+          .describe("Явное бизнес-основание принять договор вида «Прочее»"),
         lines: z.array(historicalPurchaseLine).min(1).describe("Позиции документа"),
         confirm: confirmField,
       }),
@@ -3144,6 +3148,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       settlementAccountRef,
       advanceAccountRef,
       universalDocument,
+      allowGenericContractKind,
       sumIncludesVat,
       lines,
       confirm,
@@ -3167,6 +3172,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           settlementAccountRef !== undefined ||
           advanceAccountRef !== undefined ||
           universalDocument !== undefined ||
+          allowGenericContractKind !== undefined ||
           lines.some(
             (line) =>
               line.amount !== undefined ||
@@ -3209,8 +3215,18 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           counterpartyRef,
           contractRef,
         });
-        if (contract.kind === "СПокупателем")
+        const contractKind = contract.kind?.trim() ?? "";
+        if (!contractKind)
+          throw new InputError("Договор поставщика не имеет вида; историческое поступление невозможно.");
+        if (contractKind === "СПокупателем")
           throw new InputError("Договор поставщика не может быть вида «СПокупателем»; нужен «СПоставщиком».");
+        if (contractKind !== "СПоставщиком") {
+          if (contractKind !== "Прочее" || allowGenericContractKind !== true)
+            throw new InputError(
+              `Договор поставщика вида «${contractKind}» не подходит. ` +
+                "Для вида «Прочее» требуется явное allowGenericContractKind=true.",
+            );
+        }
         const warehouseKey = await resolveWarehouse(conn, warehouse);
         if (!warehouseKey) throw new InputError("Склад не найден.");
         const props = new Map(
@@ -3282,7 +3298,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
             СчетУчета_Key: l.inventoryAccountRef ?? defaults["СчетУчета_Key"],
             СчетУчетаНДС_Key: l.vatAccountRef ?? defaults["СчетУчетаНДС_Key"],
-            // Склад строки явно пустой: склад задаётся только в шапке.
+            // Пустой склад строки — явный нулевой GUID, чтобы сервер не подставил склад шапки.
+            ...(l.warehouseEmpty ? { Склад_Key: EMPTY_GUID } : {}),
           });
         });
         const netTotal =

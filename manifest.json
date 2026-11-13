@@ -7521,6 +7521,10 @@
             "description": "ЭтоУниверсальныйДокумент",
             "type": "boolean"
           },
+          "allowGenericContractKind": {
+            "description": "Явное бизнес-основание принять договор вида «Прочее»",
+            "type": "boolean"
+          },
           "lines": {
             "minItems": 1,
             "type": "array",

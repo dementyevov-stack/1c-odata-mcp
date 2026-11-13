@@ -125,8 +125,8 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
       ИдентификаторСтроки: "SRC-P-1",
       СчетУчета_Key: ACC,
       СчетУчетаНДС_Key: ACC,
+      Склад_Key: "00000000-0000-0000-0000-000000000000",
     });
-    expect(row).not.toHaveProperty("Склад_Key");
     expect(postCount(fake)).toBe(0);
   });
 
@@ -165,7 +165,7 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
     expect(JSON.stringify(created)).toContain("Ref_Key");
   });
 
-  it("договор СПоставщиком принимается, СПокупателем — отклоняется", async () => {
+  it("принимает только известный подходящий вид договора", async () => {
     const supplier = await setup();
     const ok = await call(supplier.client, { ...args, confirm: false });
     expect(ok.isError, JSON.stringify(ok)).toBeFalsy();
@@ -175,6 +175,24 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
     expect(bad.isError).toBe(true);
     expect(JSON.stringify(bad)).toContain("СПокупателем");
     expect(postCount(customer.fake)).toBe(0);
+
+    const empty = await setup({ contractKind: "" });
+    const emptyResult = await call(empty.client, { ...args, confirm: false });
+    expect(emptyResult.isError).toBe(true);
+    expect(JSON.stringify(emptyResult)).toContain("не имеет вида");
+    expect(postCount(empty.fake)).toBe(0);
+
+    const generic = await setup({ contractKind: "Прочее" });
+    const genericResult = await call(generic.client, { ...args, confirm: false });
+    expect(genericResult.isError).toBe(true);
+    expect(JSON.stringify(genericResult)).toContain("Прочее");
+    const allowed = await call(generic.client, {
+      ...args,
+      allowGenericContractKind: true,
+      confirm: false,
+    });
+    expect(allowed.isError, JSON.stringify(allowed)).toBeFalsy();
+    expect(postCount(generic.fake)).toBe(0);
   });
 
   it("time без date не подставляет текущую дату", async () => {
