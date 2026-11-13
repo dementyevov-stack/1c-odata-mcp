@@ -3087,6 +3087,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
     sourceLineId: z.string().trim().min(1).max(200).optional().describe("ИдентификаторСтроки источника"),
     inventoryAccountRef: z.string().uuid().optional().describe("Ref_Key счёта учёта товара"),
     vatAccountRef: z.string().uuid().optional().describe("Ref_Key счёта учёта входящего НДС"),
+    unitRef: z.string().uuid().optional().describe("Ref_Key единицы измерения (ЕдиницаИзмерения_Key)"),
+    coefficient: z.number().positive().optional().describe("Явный коэффициент (Коэффициент)"),
     warehouseEmpty: z.boolean().optional().describe("Opt-in: склад строки пустой (склад только в шапке)"),
   });
 
@@ -3180,6 +3182,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               line.sourceLineId !== undefined ||
               line.inventoryAccountRef !== undefined ||
               line.vatAccountRef !== undefined ||
+              line.unitRef !== undefined ||
+              line.coefficient !== undefined ||
               line.warehouseEmpty === true ||
               !(VAT_RATES as readonly string[]).includes(line.vatRate ?? "БезНДС"),
           );
@@ -3275,6 +3279,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         ] as const)
           needRow(field, type);
         if (lines.some((l) => l.sourceLineId !== undefined)) needRow("ИдентификаторСтроки", "Edm.String");
+        if (lines.some((l) => l.unitRef !== undefined)) needRow("ЕдиницаИзмерения_Key", "Edm.Guid");
+        if (lines.some((l) => l.coefficient !== undefined)) needRow("Коэффициент", "Edm.Double");
         if (lines.some((l) => l.content !== undefined)) needRow("Содержание", "Edm.String");
         if (lines.some((l) => l.warehouseEmpty === true)) needRow("Склад_Key", "Edm.Guid");
         const refs = [
@@ -3298,6 +3304,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
             СчетУчета_Key: l.inventoryAccountRef ?? defaults["СчетУчета_Key"],
             СчетУчетаНДС_Key: l.vatAccountRef ?? defaults["СчетУчетаНДС_Key"],
+            ...(l.unitRef !== undefined ? { ЕдиницаИзмерения_Key: l.unitRef } : {}),
+            ...(l.coefficient !== undefined ? { Коэффициент: l.coefficient } : {}),
             // Пустой склад строки — явный нулевой GUID, чтобы сервер не подставил склад шапки.
             ...(l.warehouseEmpty ? { Склад_Key: EMPTY_GUID } : {}),
           });

@@ -7598,6 +7598,17 @@
                   "format": "uuid",
                   "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
                 },
+                "unitRef": {
+                  "description": "Ref_Key единицы измерения (ЕдиницаИзмерения_Key)",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "coefficient": {
+                  "description": "Явный коэффициент (Коэффициент)",
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
                 "warehouseEmpty": {
                   "description": "Opt-in: склад строки пустой (склад только в шапке)",
                   "type": "boolean"

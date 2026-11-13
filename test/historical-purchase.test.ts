@@ -10,6 +10,7 @@ const CTR = "33333333-3333-4333-8333-333333333333";
 const WH = "44444444-4444-4444-8444-444444444444";
 const NOM = "55555555-5555-4555-8555-555555555555";
 const ACC = "11111111-1111-4111-8111-111111111111";
+const UNIT = "66666666-6666-4666-8666-666666666666";
 const DOC = "99999999-9999-4999-8999-999999999999";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -19,7 +20,13 @@ afterEach(async () => {
 });
 
 async function setup(
-  options: { documents?: Record<string, unknown>[]; rowWarehouse?: string; contractKind?: string } = {},
+  options: {
+    documents?: Record<string, unknown>[];
+    rowWarehouse?: string;
+    rowUnit?: string;
+    rowCoefficient?: number;
+    contractKind?: string;
+  } = {},
 ) {
   const data = (q: FakeQuery): Record<string, unknown>[] | undefined =>
     q.base === "Document_ПоступлениеТоваровУслуг" ? (options.documents ?? []) : undefined;
@@ -39,6 +46,8 @@ async function setup(
       const rows = (actual["Товары"] as Array<Record<string, unknown>>).map((row) => ({
         ...row,
         ...(options.rowWarehouse ? { Склад_Key: options.rowWarehouse } : {}),
+        ...(options.rowUnit !== undefined ? { ЕдиницаИзмерения_Key: options.rowUnit } : {}),
+        ...(options.rowCoefficient !== undefined ? { Коэффициент: options.rowCoefficient } : {}),
       }));
       return { DeletionMark: false, ...actual, Товары: rows };
     }
@@ -91,6 +100,8 @@ const args = {
       sourceLineId: "SRC-P-1",
       inventoryAccountRef: ACC,
       vatAccountRef: ACC,
+      unitRef: UNIT,
+      coefficient: 1,
       warehouseEmpty: true,
     },
   ],
@@ -125,6 +136,8 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
       ИдентификаторСтроки: "SRC-P-1",
       СчетУчета_Key: ACC,
       СчетУчетаНДС_Key: ACC,
+      ЕдиницаИзмерения_Key: UNIT,
+      Коэффициент: 1,
       Склад_Key: "00000000-0000-0000-0000-000000000000",
     });
     expect(postCount(fake)).toBe(0);
@@ -150,6 +163,8 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
         "Товары[1].Сумма",
         "Товары[1].СуммаНДС",
         "Товары[1].ИдентификаторСтроки",
+        "Товары[1].ЕдиницаИзмерения_Key",
+        "Товары[1].Коэффициент",
       ]),
     );
     expect(postCount(fake)).toBe(1);
@@ -201,6 +216,17 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result)).toContain("date");
     expect(postCount(fake)).toBe(0);
+  });
+
+  it("единица и коэффициент участвуют в GET: пустая единица/0 ломают verification", async () => {
+    const { client } = await setup({ rowUnit: "", rowCoefficient: 0 });
+    const preview = await call(client, { ...args, confirm: false });
+    const operationId = preview.structuredContent?.operationId;
+    const created = await call(client, { ...args, confirm: true, operationId });
+    expect(created.isError).toBe(true);
+    expect(JSON.stringify(created)).toContain("ЕдиницаИзмерения_Key");
+    expect(JSON.stringify(created)).toContain("Коэффициент");
+    expect(JSON.stringify(created)).toContain("Ref_Key");
   });
 
   it("дубль номера в том же году блокирует POST", async () => {
