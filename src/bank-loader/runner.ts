@@ -463,9 +463,12 @@ const hashPlan = (value: Record<string, unknown>): string =>
     .digest("hex");
 
 const SIGNIFICANT_HEADER = [
+  "Date",
+  "Posted",
   "Организация_Key",
   "СчетОрганизации_Key",
   "Контрагент",
+  "Контрагент_Type",
   "ДоговорКонтрагента_Key",
   "ВидОперации",
   "СуммаДокумента",
@@ -476,6 +479,8 @@ const SIGNIFICANT_HEADER = [
 ] as const;
 const SIGNIFICANT_ROW = [
   "ДоговорКонтрагента_Key",
+  "СчетУчетаРасчетовСКонтрагентом_Key",
+  "СчетУчетаРасчетовПоАвансам_Key",
   "СпособПогашенияЗадолженности",
   "СуммаПлатежа",
   "СтавкаНДС",
@@ -525,7 +530,14 @@ function verifyDocument(
   for (const [field, value] of Object.entries(expected.header))
     if (!samePlannedValue(value, actual[field]))
       mismatches.push({ field, expected: value, actual: actual[field] });
-  const row = (actual["РасшифровкаПлатежа"] as Array<Record<string, unknown>> | undefined)?.[0];
+  const rows = actual["РасшифровкаПлатежа"];
+  if (!Array.isArray(rows) || rows.length !== 1)
+    mismatches.push({
+      field: "РасшифровкаПлатежа",
+      expected: "ровно одна строка",
+      actual: Array.isArray(rows) ? `строк: ${rows.length}` : "нет табличной части",
+    });
+  const row = Array.isArray(rows) ? (rows[0] as Record<string, unknown> | undefined) : undefined;
   for (const [field, value] of Object.entries(expected.row))
     if (!samePlannedValue(value, row?.[field]))
       mismatches.push({ field: `РасшифровкаПлатежа.${field}`, expected: value, actual: row?.[field] });
@@ -740,6 +752,15 @@ async function runOne(
       };
     }
   }
+
+  if (mode === "confirm" && preparedState?.state !== "prepared")
+    return {
+      sourceKey: source.sourceKey,
+      action: "blocked",
+      note:
+        "Нет проверенного плана: load/resume с --confirm подтверждает только строку, " +
+        "для которой ранее выполнен prepare. В 1С ничего не записано.",
+    };
 
   const reuse =
     preparedState?.state === "prepared" &&

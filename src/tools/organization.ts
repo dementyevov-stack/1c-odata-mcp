@@ -303,7 +303,8 @@ export function registerOrganizationTools(server: McpServer, ctx: ServerContext)
         const org = await resolveOrganization(conn, organization);
         const orgSet = resolveEntity(CATALOGS.organizations, await conn.available());
         if (!orgSet) return fail("Справочник «Организации» не опубликован в OData.", "not_published");
-        const found = await findBankAccountsByOwnerAndNumber(conn, org.ref, accountNumber);
+        const ownerType = `StandardODATA.${orgSet}`;
+        const found = await findBankAccountsByOwnerAndNumber(conn, org.ref, accountNumber, ownerType);
         if (found.truncated)
           return fail(
             "Банковские счета: достигнут предел строк, проход неполный. Нельзя утверждать, " +
@@ -322,7 +323,7 @@ export function registerOrganizationTools(server: McpServer, ctx: ServerContext)
           accountNumber,
           found: Boolean(account),
           ...(account ? { account } : {}),
-          ownerType: `StandardODATA.${orgSet}`,
+          ownerType,
           ...(account
             ? {}
             : {

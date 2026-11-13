@@ -152,6 +152,18 @@ async function fixture(options: FixtureOptions = {}) {
 const postCount = (fake: ReturnType<typeof fake1C>): number =>
   fake.requests.filter((r) => r.method === "POST").length;
 
+/** Оператор сначала видит и проверяет план, затем подтверждает его. */
+async function prepareAndConfirm(
+  client: Parameters<typeof runPackage>[0],
+  target: TargetRequisites,
+  source: SourceDocument,
+  journal: BankLoadJournal,
+  mode: "confirm" | "resume" = "confirm",
+) {
+  await runPackage(client, target, [source], journal, { confirm: false, mode: "prepare" });
+  return runPackage(client, target, [source], journal, { confirm: true, mode });
+}
+
 const paymentArgs = (operationId?: string) => ({
   sourceKey: source.sourceKey,
   organizationInn: target.organizationInn,
@@ -253,11 +265,19 @@ describe("подготовка оплаты покупателя", () => {
     expect(postCount(fake)).toBe(0);
   });
 
+  it("load --confirm без заранее проверенного плана отказывает и не пишет", async () => {
+    const { client, fake, journal } = await fixture();
+    const run = await runPackage(client, target, [source], journal, { confirm: true });
+    expect(run.documents[0]?.action).toBe("blocked");
+    expect(run.documents[0]?.note).toContain("Нет проверенного плана");
+    expect(postCount(fake)).toBe(0);
+  });
+
   it("отказывает при неоднозначном контрагенте и ничего не пишет", async () => {
     const { client, fake, journal } = await fixture({
       counterparties: [cpRow, { ...cpRow, Ref_Key: CTR, Description: "Дубль" }],
     });
-    const run = await runPackage(client, target, [source], journal, { confirm: true });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
     expect(run.documents[0]?.action).toBe("rejected");
     expect(run.documents[0]?.note).toContain("несколько контрагентов");
     expect(postCount(fake)).toBe(0);
@@ -266,7 +286,7 @@ describe("подготовка оплаты покупателя", () => {
 
   it("создаёт один документ, связывает sourceKey с Ref_Key и не дублирует при повторе", async () => {
     const { client, fake, journal } = await fixture();
-    const first = await runPackage(client, target, [source], journal, { confirm: true });
+    const first = await prepareAndConfirm(client, target, source, journal);
     expect(first.documents[0]?.action).toBe("created");
     expect(first.documents[0]?.verification).toBe("ok");
     const entry = await journal.get(source.sourceKey);
@@ -282,7 +302,7 @@ describe("подготовка оплаты покупателя", () => {
 
   it("после потерянного ответа находит созданный документ и не делает второй POST", async () => {
     const { client, fake, journal } = await fixture({ dropPostResponse: true });
-    const first = await runPackage(client, target, [source], journal, { confirm: true });
+    const first = await prepareAndConfirm(client, target, source, journal);
     expect(first.documents[0]?.action).toBe("unknown");
     expect(postCount(fake)).toBe(1);
     expect(await journal.get(source.sourceKey)).toMatchObject({ state: "unknown" });
@@ -312,6 +332,8 @@ describe("подготовка оплаты покупателя", () => {
         };
       return actual;
     });
+    const prepared = await runPackage(client, target, [source], journal, { confirm: false });
+    expect(prepared.documents[0]?.action).toBe("dry_run");
     const first = await runPackage(client, target, [source], journal, { confirm: true });
     expect(first.documents[0]?.action).toBe("created");
     expect(first.documents[0]?.verification).toBe("failed");
@@ -368,33 +390,43 @@ describe("подготовка оплаты покупателя", () => {
 
   it("найденный после неизвестного POST документ сверяется по полям, а не только по Ref_Key", async () => {
     const { client, fake, journal } = await fixture({ dropPostResponse: true });
-    const first = await runPackage(client, target, [source], journal, { confirm: true });
+    const first = await prepareAndConfirm(client, target, source, journal);
     expect(first.documents[0]?.action).toBe("unknown");
     const original = fake.conn.client.getEntity.bind(fake.conn.client);
     vi.spyOn(fake.conn.client, "getEntity").mockImplementation(async (path: string) => {
       const actual = await original(path);
-      if (path.startsWith("Document_ПоступлениеНаРасчетныйСчет(") && !path.includes("$select"))
+      if (path.startsWith("Document_ПоступлениеНаРасчетныйСчет(") && !path.includes("$select")) {
+        const row = (actual["РасшифровкаПлатежа"] as Array<Record<string, unknown>>)[0]!;
         return {
           ...actual,
+          Date: "2020-01-01T00:00:00",
+          Posted: true,
           РасшифровкаПлатежа: [
             {
-              ...(actual["РасшифровкаПлатежа"] as Array<Record<string, unknown>>)[0],
+              ...row,
               СуммаНДС: 0,
+              СчетУчетаРасчетовСКонтрагентом_Key: "00000000-0000-0000-0000-000000000001",
             },
+            { ...row, LineNumber: 2 },
           ],
         };
+      }
       return actual;
     });
     const resumed = await runPackage(client, target, [source], journal, { confirm: true, mode: "resume" });
     expect(resumed.documents[0]?.action).toBe("reconciled");
     expect(resumed.documents[0]?.verification).toBe("failed");
-    expect(resumed.documents[0]?.mismatches).toBeTruthy();
+    const mismatches = JSON.stringify(resumed.documents[0]?.mismatches);
+    expect(mismatches).toContain("Date");
+    expect(mismatches).toContain("Posted");
+    expect(mismatches).toContain("РасшифровкаПлатежа");
+    expect(mismatches).toContain("СчетУчетаРасчетовСКонтрагентом_Key");
     expect(postCount(fake)).toBe(1);
   });
 
   it("уже загруженный sourceKey с изменённым источником остаётся конфликтом", async () => {
     const { client, fake, journal } = await fixture();
-    const first = await runPackage(client, target, [source], journal, { confirm: true });
+    const first = await prepareAndConfirm(client, target, source, journal);
     expect(first.documents[0]?.action).toBe("created");
     const changed = { ...source, amount: 999 };
     const again = await runPackage(client, target, [changed], journal, { confirm: true });
@@ -411,7 +443,7 @@ describe("подготовка оплаты покупателя", () => {
     const entities = new Map(meta.entities);
     entities.set(rowSet, { ...row, properties: row.properties.filter((p) => p.name !== "СтавкаНДС") });
     vi.spyOn(fake.conn, "getMetadata").mockResolvedValue({ ...meta, entities });
-    const run = await runPackage(client, target, [source], journal, { confirm: true });
+    const run = await runPackage(client, target, [source], journal, { confirm: false });
     expect(run.documents[0]?.action).toBe("rejected");
     expect(run.documents[0]?.note).toContain("СтавкаНДС");
     expect(postCount(fake)).toBe(0);
@@ -420,7 +452,7 @@ describe("подготовка оплаты покупателя", () => {
   it("явная ставка без суммы НДС отклоняется до записи", async () => {
     const { client, fake, journal } = await fixture();
     const bad = { ...source, vatAmount: undefined };
-    const run = await runPackage(client, target, [bad], journal, { confirm: true });
+    const run = await runPackage(client, target, [bad], journal, { confirm: false });
     expect(run.documents[0]?.action).toBe("rejected");
     expect(run.documents[0]?.note).toContain("и ставку");
     expect(postCount(fake)).toBe(0);

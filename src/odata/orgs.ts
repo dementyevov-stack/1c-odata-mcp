@@ -17,10 +17,19 @@ export interface Organization {
 const orgSet = (conn: Connection): Promise<string> =>
   requireEntity(conn, CATALOGS.organizations, "Справочник «Организации»");
 
+/** Опубликованные поля организаций; undefined — схема недоступна (старые/тестовые подключения). */
+async function orgFields(conn: Connection, set: string): Promise<Set<string> | undefined> {
+  try {
+    return new Set((await conn.getMetadata()).entities.get(set)?.properties.map((p) => p.name) ?? []);
+  } catch {
+    return undefined;
+  }
+}
+
 async function loadOrganizations(conn: Connection): Promise<Organization[]> {
   const set = await orgSet(conn);
-  const props = new Set((await conn.getMetadata()).entities.get(set)?.properties.map((p) => p.name) ?? []);
-  const select = ["Ref_Key", "Description", "ИНН", ...(props.has("КПП") ? ["КПП"] : [])];
+  const props = await orgFields(conn, set);
+  const select = ["Ref_Key", "Description", "ИНН", ...(props?.has("КПП") !== false ? ["КПП"] : [])];
   const { rows } = await fetchAll(
     conn.client,
     set,
@@ -134,9 +143,9 @@ export async function findOrganizationsByRequisites(
   if (!innDigits(inn)) throw new InputError("ИНН организации должен содержать 10 или 12 цифр.");
   if (kpp && !kppDigits(kpp)) throw new InputError("КПП организации должен содержать 9 цифр.");
   const set = await orgSet(conn);
-  const props = new Set((await conn.getMetadata()).entities.get(set)?.properties.map((p) => p.name) ?? []);
-  if (!props.has("ИНН")) throw new InputError("Справочник «Организации» не публикует поле «ИНН».");
-  const hasKpp = props.has("КПП");
+  const props = await orgFields(conn, set);
+  if (props && !props.has("ИНН")) throw new InputError("Справочник «Организации» не публикует поле «ИНН».");
+  const hasKpp = props ? props.has("КПП") : true;
   if (kpp && !hasKpp)
     throw new InputError(
       "Справочник «Организации» не публикует поле «КПП» — точная сверка КПП невозможна; " +

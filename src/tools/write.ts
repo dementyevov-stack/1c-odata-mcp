@@ -1495,13 +1495,19 @@ async function createOrPreview(
   confirm: boolean,
   notes?: string[],
   /** keepSettlement — счета расчётов уже заданы (копия документа): настройку договора не применять. */
-  opts?: { keepSettlement?: boolean; settlementSide?: SettlementSide },
+  opts?: {
+    keepSettlement?: boolean;
+    settlementSide?: SettlementSide;
+    /** Итоговый payload после договора/счетов/метки — для контрольного чтения конкретного инструмента. */
+    prepared?: (payload: Record<string, unknown>) => void;
+  },
 ): Promise<CallToolResult> {
   const contract = await withDefaultContract(conn, entitySet, payload);
   const settlement = opts?.keepSettlement
     ? { payload: contract.payload, notes: [] }
     : await withSettlementAccounts(conn, entitySet, contract.payload, opts?.settlementSide);
   payload = await withOperationMarker(conn, entitySet, settlement.payload);
+  opts?.prepared?.(payload);
   const allNotes = [...(notes ?? []), ...contract.notes, ...settlement.notes];
   const extra = allNotes.length ? { notes: allNotes } : {};
   if (!confirm) {
@@ -3924,8 +3930,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ? `НДС переносится явно: ставка ${vatRateValue}, сумма ${vatAmountValue}.`
             : "НДС в источнике не задан: выставлены «БезНДС» и 0 — как у обычной оплаты покупателя.",
         );
+        let effectivePayload = payload;
         const created = await createOrPreview(conn, set, payload, confirm, notes, {
           settlementSide: "customer",
+          prepared: (prepared) => {
+            effectivePayload = prepared;
+          },
         });
         const createdData = created.structuredContent as Record<string, unknown> | undefined;
         if (!createdData || created.isError) return created;
@@ -3945,9 +3955,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         // Что именно проверяем контрольным чтением: только явно перенесённые/заполненные нами поля.
         // Счета расчётов MCP может уточнить по настройке договора — их сверяет отдельный путь.
         const expectedHeader: Record<string, unknown> = {
+          Date: payload["Date"],
+          Posted: false,
           Организация_Key: org.ref,
           СчетОрганизации_Key: bank.ref,
           Контрагент: counterparty.ref,
+          ...(cpSet ? { Контрагент_Type: `StandardODATA.${cpSet}` } : {}),
           ДоговорКонтрагента_Key: contract.ref,
           ВидОперации: payload["ВидОперации"],
           СуммаДокумента: normalizedAmount,
@@ -3956,12 +3969,20 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ...(incomingDate ? { ДатаВходящегоДокумента: incomingDate } : {}),
           ...(payerBank ? { СчетКонтрагента_Key: payerBank.ref } : {}),
         };
+        const effectiveRow =
+          (effectivePayload["РасшифровкаПлатежа"] as Array<Record<string, unknown>> | undefined)?.[0] ?? {};
         const expectedRow: Record<string, unknown> = {
           ДоговорКонтрагента_Key: contract.ref,
           СпособПогашенияЗадолженности: "Автоматически",
           СуммаПлатежа: normalizedAmount,
           СтавкаНДС: vatRateValue,
           СуммаНДС: vatAmountValue,
+          ...(effectiveRow["СчетУчетаРасчетовСКонтрагентом_Key"] !== undefined
+            ? { СчетУчетаРасчетовСКонтрагентом_Key: effectiveRow["СчетУчетаРасчетовСКонтрагентом_Key"] }
+            : {}),
+          ...(effectiveRow["СчетУчетаРасчетовПоАвансам_Key"] !== undefined
+            ? { СчетУчетаРасчетовПоАвансам_Key: effectiveRow["СчетУчетаРасчетовПоАвансам_Key"] }
+            : {}),
         };
         const verificationPlan = [
           ...Object.keys(expectedHeader),
@@ -4011,6 +4032,13 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           };
         }
         const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
+        const actualRows = actual["РасшифровкаПлатежа"];
+        if (!Array.isArray(actualRows) || actualRows.length !== 1)
+          mismatches.push({
+            field: "РасшифровкаПлатежа",
+            expected: "ровно одна строка",
+            actual: Array.isArray(actualRows) ? `строк: ${actualRows.length}` : "нет табличной части",
+          });
         const compare = (field: string, expected: unknown, where: "header" | "row"): void => {
           const props = where === "header" ? headerProps : rowProps;
           const type = props.get(field) ?? "Edm.String";
@@ -4452,7 +4480,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "если он есть — ничего не пишет и возвращает existing=true. Если счёта нет — создаёт его в том же " +
         "справочнике «Банковские счета» с владельцем-организацией (Owner = Ref_Key организации), а не " +
         "контрагентом. Dry-run по умолчанию. Счёт контрагента за счёт организации не выдаётся: владелец " +
-        "проверяется до и после записи. makeMain обновляет ОсновнойБанковскийСчет организации отдельным PATCH.",
+        "проверяется до и после записи. Основной счёт организации этот путь не меняет — это делается в 1С осознанно.",
       inputSchema: z.object({
         database: databaseField,
         organizationRef: z.string().uuid().describe("Ref_Key организации-владельца счёта"),
@@ -4460,12 +4488,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         bik: z.string().trim().describe("БИК банка (ищется в справочнике «Банки»)"),
         currency: z.string().optional().describe("Валюта (код/название; по умолчанию рубль)"),
         label: z.string().optional().describe("Наименование счёта (по умолчанию — номер счёта)"),
-        makeMain: z.boolean().default(false).describe("Сделать основным счётом организации"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
     },
-    ({ database, organizationRef, accountNumber, bik, currency, label, makeMain, confirm }) =>
+    ({ database, organizationRef, accountNumber, bik, currency, label, confirm }) =>
       guard("write.organization.create_bank_account", async () => {
         const conn = ctx.db(database);
         const set = await requireEntity(conn, CATALOGS.bankAccounts, "Справочник «Банковские счета»");
@@ -4487,21 +4514,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         need("Банк_Key", "Edm.Guid");
         need("ВалютаДенежныхСредств_Key", "Edm.Guid");
         const orgSet = await resolveSet(conn, CATALOGS.organizations, "Организации");
-        const orgMeta = meta.entities.get(orgSet);
-        if (
-          makeMain &&
-          orgMeta?.properties.find((p) => p.name === "ОсновнойБанковскийСчет_Key")?.type !== "Edm.Guid"
-        )
-          throw new InputError(
-            "Схема организации не публикует «ОсновнойБанковскийСчет_Key» — сделать счёт основным нельзя. " +
-              "Создайте его без makeMain.",
-          );
         const orgRef = organizationRef.replace(/[{}']/g, "").toLowerCase();
         let orgDoc: ODataEntity;
         try {
           orgDoc = await conn.client.getEntity(
-            `${orgSet}(${odataGuid(orgRef)})?$format=json&$select=Ref_Key,Description,DeletionMark` +
-              (makeMain ? ",ОсновнойБанковскийСчет_Key" : ""),
+            `${orgSet}(${odataGuid(orgRef)})?$format=json&$select=Ref_Key,Description,DeletionMark`,
           );
         } catch (error) {
           if (error instanceof ODataError && error.kind === "not_found")
@@ -4511,7 +4528,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         if (orgDoc.DeletionMark === true) throw new InputError("Организация помечена на удаление.");
         if (String(orgDoc.Ref_Key).toLowerCase() !== orgRef)
           throw new InputError("1С вернула другую организацию — счёт не создан.");
-        const existing = await findBankAccountsByOwnerAndNumber(conn, orgRef, accountNumber);
+        const ownerType = `StandardODATA.${orgSet}`;
+        const existing = await findBankAccountsByOwnerAndNumber(conn, orgRef, accountNumber, ownerType);
         if (existing.truncated)
           return fail(
             "Банковские счета: достигнут предел строк, проход неполный. Нельзя утверждать, " +
@@ -4523,7 +4541,6 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             `У организации несколько счетов с номером ${accountNumber} — исправьте справочник 1С.`,
             "refused",
           );
-        const ownerType = `StandardODATA.${orgSet}`;
         const found = existing.accounts[0];
         if (found)
           return ok({
@@ -4548,19 +4565,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           Банк_Key: bank.ref,
           ВалютаДенежныхСредств_Key: cur.ref,
         });
-        const result = await createSubordinate(
-          conn,
-          set,
-          payload,
-          confirm,
-          makeMain
-            ? {
-                ownerSet: orgSet,
-                ownerRef: orgRef,
-                field: "ОсновнойБанковскийСчет_Key",
-              }
-            : undefined,
-        );
+        const result = await createSubordinate(conn, set, payload, confirm);
         const data = result.structuredContent as Record<string, unknown> | undefined;
         if (result.isError || !data) return result;
         if (data.dryRun === true)
@@ -4621,32 +4626,6 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               actualOwnerType: String(actual.Owner_Type ?? ""),
             },
           };
-        if (makeMain) {
-          let main: unknown;
-          try {
-            const orgNow = await conn.client.getEntity(
-              `${orgSet}(${odataGuid(orgRef)})?$format=json&$select=ОсновнойБанковскийСчет_Key`,
-            );
-            main = orgNow["ОсновнойБанковскийСчет_Key"];
-          } catch {
-            main = undefined;
-          }
-          if (String(main ?? "").toLowerCase() !== ref.toLowerCase())
-            return {
-              ...result,
-              isError: true,
-              _meta: { "odata-1c/errorKind": "refused" },
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `Счёт создан (Ref_Key ${ref}), но основным счётом организации не стал. ` +
-                    "Проверьте поле «Основной банковский счёт» в 1С вручную.",
-                },
-              ],
-              structuredContent: { ...data, ownerRef: orgRef, ownerType, verification: "failed" },
-            };
-        }
         return withStructured(result, {
           ownerRef: orgRef,
           ownerType,

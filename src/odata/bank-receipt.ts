@@ -1,5 +1,5 @@
 import type { Connection } from "../context.js";
-import { CATALOGS } from "../config/mapping.js";
+import { CATALOGS, resolveEntity } from "../config/mapping.js";
 import { InputError } from "../errors.js";
 import type { ODataEntity } from "../types/odata.js";
 import { ODataError } from "./errors.js";
@@ -252,6 +252,7 @@ export async function findBankAccountsByOwnerAndNumber(
   conn: Connection,
   ownerKey: string,
   accountNumber: string,
+  expectedOwnerType?: string,
 ): Promise<{ accounts: Array<{ ref: string; number: string; name?: string }>; truncated: boolean }> {
   const number = accountNumber.trim();
   if (!/^\d{20}$/.test(number)) throw new InputError("Номер банковского счёта должен содержать 20 цифр.");
@@ -287,7 +288,11 @@ export async function findBankAccountsByOwnerAndNumber(
   }
   const owner = guid(ownerKey);
   const exact = found.rows.filter(
-    (r) => str(r["НомерСчета"]).trim() === number && guid(r["Owner"]) === owner && r["DeletionMark"] !== true,
+    (r) =>
+      str(r["НомерСчета"]).trim() === number &&
+      guid(r["Owner"]) === owner &&
+      (!expectedOwnerType || str(r["Owner_Type"]) === expectedOwnerType) &&
+      r["DeletionMark"] !== true,
   );
   return {
     accounts: exact.map((r) => ({
@@ -304,8 +309,9 @@ export async function resolveBankAccountByOwnerAndNumber(
   ownerKey: string,
   accountNumber: string,
   label: string,
+  expectedOwnerType?: string,
 ): Promise<{ ref: string; number: string; name?: string }> {
-  const found = await findBankAccountsByOwnerAndNumber(conn, ownerKey, accountNumber);
+  const found = await findBankAccountsByOwnerAndNumber(conn, ownerKey, accountNumber, expectedOwnerType);
   if (found.truncated)
     throw new InputError(
       "Банковские счета: достигнут предел строк, проход неполный. " +
@@ -323,20 +329,38 @@ export async function resolveBankAccountByOwnerAndNumber(
   return found.accounts[0]!;
 }
 
-export function resolveOrgBankAccountByNumber(
+export async function resolveOrgBankAccountByNumber(
   conn: Connection,
   orgKey: string,
   accountNumber: string,
 ): Promise<{ ref: string; number: string; name?: string }> {
-  return resolveBankAccountByOwnerAndNumber(conn, orgKey, accountNumber, "организации");
+  const orgSet = resolveEntity(CATALOGS.organizations, await conn.available());
+  if (!orgSet)
+    throw new InputError("Справочник «Организации» не опубликован — счёт организации не сопоставить.");
+  return resolveBankAccountByOwnerAndNumber(
+    conn,
+    orgKey,
+    accountNumber,
+    "организации",
+    `StandardODATA.${orgSet}`,
+  );
 }
 
-export function resolveCounterpartyBankAccountByNumber(
+export async function resolveCounterpartyBankAccountByNumber(
   conn: Connection,
   counterpartyRef: string,
   accountNumber: string,
 ): Promise<{ ref: string; number: string; name?: string }> {
-  return resolveBankAccountByOwnerAndNumber(conn, counterpartyRef, accountNumber, "контрагента");
+  const cpSet = resolveEntity(CATALOGS.counterparties, await conn.available());
+  if (!cpSet)
+    throw new InputError("Справочник «Контрагенты» не опубликован — счёт контрагента не сопоставить.");
+  return resolveBankAccountByOwnerAndNumber(
+    conn,
+    counterpartyRef,
+    accountNumber,
+    "контрагента",
+    `StandardODATA.${cpSet}`,
+  );
 }
 
 /** Простой $select для одиночного GET (buildQuery не нужен: только поля, без фильтра). */
