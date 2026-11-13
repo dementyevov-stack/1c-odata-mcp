@@ -3092,6 +3092,23 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
     warehouseEmpty: z.boolean().optional().describe("Opt-in: склад строки пустой (склад только в шапке)"),
   });
 
+  const purchaseAnalytic = z.object({
+    ref: z.string().uuid().describe("Ref_Key аналитики"),
+    type: z.string().trim().min(1).max(200).describe("Тип ссылки, напр. StandardODATA.Catalog_Контрагенты"),
+  });
+  const historicalPurchaseServiceLine = z.object({
+    ...baseLineShape,
+    vatRate: z.enum(BANK_VAT_RATES).default("БезНДС").describe("Ставка НДС, включая исторические"),
+    amount: z.number().nonnegative().optional().describe("Явная сумма строки"),
+    vatAmount: z.number().nonnegative().optional().describe("Явная сумма НДС строки"),
+    sourceLineId: z.string().trim().min(1).max(200).optional().describe("ИдентификаторСтроки источника"),
+    costAccountRef: z.string().uuid().optional().describe("Ref_Key счёта затрат БУ"),
+    costAccountNuRef: z.string().uuid().optional().describe("Ref_Key счёта затрат НУ"),
+    vatAccountRef: z.string().uuid().optional().describe("Ref_Key счёта входящего НДС"),
+    analytics: z.array(purchaseAnalytic).max(3).optional().describe("Субконто БУ1..3"),
+    analyticsNu: z.array(purchaseAnalytic).max(3).optional().describe("СубконтоНУ1..3"),
+  });
+
   server.registerTool(
     "write.purchase.create_purchase",
     {
@@ -3128,7 +3145,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .boolean()
           .optional()
           .describe("Явное бизнес-основание принять договор вида «Прочее»"),
-        lines: z.array(historicalPurchaseLine).min(1).describe("Позиции документа"),
+        lines: z.array(historicalPurchaseLine).min(1).describe("Товарные позиции документа"),
+        serviceLines: z
+          .array(historicalPurchaseServiceLine)
+          .min(1)
+          .optional()
+          .describe("Сервисные позиции в отдельной таблице «Услуги»"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
@@ -3153,6 +3175,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       allowGenericContractKind,
       sumIncludesVat,
       lines,
+      serviceLines,
       confirm,
     }) =>
       guard("write.purchase.create_purchase", async () => {
@@ -3175,6 +3198,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           advanceAccountRef !== undefined ||
           universalDocument !== undefined ||
           allowGenericContractKind !== undefined ||
+          serviceLines !== undefined ||
           lines.some(
             (line) =>
               line.amount !== undefined ||
@@ -3283,6 +3307,52 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         if (lines.some((l) => l.coefficient !== undefined)) needRow("Коэффициент", "Edm.Double");
         if (lines.some((l) => l.content !== undefined)) needRow("Содержание", "Edm.String");
         if (lines.some((l) => l.warehouseEmpty === true)) needRow("Склад_Key", "Edm.Guid");
+        if (serviceLines) {
+          const serviceProps = new Map(
+            (await conn.getMetadata()).entities
+              .get(`${set}_Услуги`)
+              ?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          for (const [field, type] of [
+            ["Номенклатура_Key", "Edm.Guid"],
+            ["Количество", "Edm.Double"],
+            ["Цена", "Edm.Double"],
+            ["Сумма", "Edm.Double"],
+            ["СтавкаНДС", "Edm.String"],
+            ["СуммаНДС", "Edm.Double"],
+            ["СчетЗатрат_Key", "Edm.Guid"],
+            ["СчетЗатратНУ_Key", "Edm.Guid"],
+            ["СчетУчетаНДС_Key", "Edm.Guid"],
+          ] as const)
+            if (serviceProps.get(field) !== type)
+              throw new InputError(`Схема услуги поступления не публикует ${field} с типом ${type}.`);
+          if (
+            serviceLines.some((l) => l.sourceLineId !== undefined) &&
+            serviceProps.get("ИдентификаторСтроки") !== "Edm.String"
+          )
+            throw new InputError("Схема услуги поступления не публикует ИдентификаторСтроки.");
+          if (serviceLines.some((l) => l.analytics !== undefined)) {
+            if (
+              serviceProps.get("Субконто1") !== "Edm.String" ||
+              serviceProps.get("Субконто1_Type") !== "Edm.String"
+            )
+              throw new InputError("Схема услуги поступления не публикует Субконто БУ.");
+          }
+          if (serviceLines.some((l) => l.analyticsNu !== undefined)) {
+            if (
+              serviceProps.get("СубконтоНУ1") !== "Edm.String" ||
+              serviceProps.get("СубконтоНУ1_Type") !== "Edm.String"
+            )
+              throw new InputError("Схема услуги поступления не публикует Субконто НУ.");
+          }
+          const serviceRefs = serviceLines.flatMap((l) => [
+            l.costAccountRef,
+            l.costAccountNuRef,
+            l.vatAccountRef,
+          ]);
+          if (serviceRefs.some((r) => r !== undefined))
+            await accountsByRef(conn, [...new Set(serviceRefs.filter((r): r is string => Boolean(r)))]);
+        }
         const refs = [
           settlementAccountRef,
           advanceAccountRef,
@@ -3310,10 +3380,39 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ...(l.warehouseEmpty ? { Склад_Key: EMPTY_GUID } : {}),
           });
         });
+        const serviceRows = (serviceLines ?? []).map((l, i) => {
+          const analytics = (
+            items: typeof l.analytics | undefined,
+            prefix: string,
+          ): Record<string, unknown> =>
+            Object.fromEntries(
+              (items ?? []).flatMap((item, index) => [
+                [`${prefix}${index + 1}`, item.ref],
+                [`${prefix}${index + 1}_Type`, item.type],
+              ]),
+            );
+          return clean({
+            ...(l.sourceLineId !== undefined ? { ИдентификаторСтроки: l.sourceLineId } : {}),
+            ...analytics(l.analytics, "Субконто"),
+            ...analytics(l.analyticsNu, "СубконтоНУ"),
+            LineNumber: i + 1,
+            Номенклатура_Key: l.nomenclatureRef,
+            ...(l.content === undefined ? {} : { Содержание: l.content }),
+            Количество: l.quantity,
+            Цена: l.price,
+            Сумма: l.amount ?? lineSum(l),
+            СтавкаНДС: l.vatRate,
+            ...(l.vatAmount !== undefined ? { СуммаНДС: l.vatAmount } : {}),
+            ...(l.costAccountRef !== undefined ? { СчетЗатрат_Key: l.costAccountRef } : {}),
+            ...(l.costAccountNuRef !== undefined ? { СчетЗатратНУ_Key: l.costAccountNuRef } : {}),
+            ...(l.vatAccountRef !== undefined ? { СчетУчетаНДС_Key: l.vatAccountRef } : {}),
+          });
+        });
+        const allRows = [...rows, ...serviceRows];
         const netTotal =
-          Math.round(rows.reduce((sum, row) => sum + Number(row["Сумма"] ?? 0), 0) * 100) / 100;
+          Math.round(allRows.reduce((sum, row) => sum + Number(row["Сумма"] ?? 0), 0) * 100) / 100;
         const vatTotal =
-          Math.round(rows.reduce((sum, row) => sum + Number(row["СуммаНДС"] ?? 0), 0) * 100) / 100;
+          Math.round(allRows.reduce((sum, row) => sum + Number(row["СуммаНДС"] ?? 0), 0) * 100) / 100;
         const total =
           documentTotal ?? (sumIncludesVat ? netTotal : Math.round((netTotal + vatTotal) * 100) / 100);
         const now = new Date();
@@ -3390,6 +3489,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           СуммаВключаетНДС: sumIncludesVat,
           СуммаДокумента: total,
           Товары: rows,
+          ...(serviceLines ? { Услуги: serviceRows } : {}),
         });
         let effectivePayload = payload;
         const created = await createOrPreview(conn, set, payload, confirm, undefined, {
@@ -3477,6 +3577,32 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               });
           });
         }
+        if (serviceLines) {
+          const actualServices = actual["Услуги"];
+          if (!Array.isArray(actualServices) || actualServices.length !== serviceRows.length)
+            mismatches.push({
+              field: "Услуги",
+              expected: `строк: ${serviceRows.length}`,
+              actual: Array.isArray(actualServices) ? `строк: ${actualServices.length}` : "нет таблицы",
+            });
+          else {
+            const typesService = new Map(
+              (await conn.getMetadata()).entities
+                .get(`${set}_Услуги`)
+                ?.properties.map((p) => [p.name, p.type]) ?? [],
+            );
+            serviceRows.forEach((expected, index) => {
+              const actualRow = actualServices[index] as Record<string, unknown>;
+              for (const [field, value] of Object.entries(expected))
+                if (!sameStoredValue(value, actualRow[field], typesService.get(field) ?? "Edm.String"))
+                  mismatches.push({
+                    field: `Услуги[${index + 1}].${field}`,
+                    expected: value,
+                    actual: actualRow[field],
+                  });
+            });
+          }
+        }
         if (mismatches.length)
           return {
             ...created,
@@ -3495,6 +3621,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           verifiedFields: [
             ...Object.keys(expectedHeader),
             ...rows.flatMap((row, i) => Object.keys(row).map((field) => `Товары[${i + 1}].${field}`)),
+            ...serviceRows.flatMap((row, i) => Object.keys(row).map((field) => `Услуги[${i + 1}].${field}`)),
           ],
         });
       }),

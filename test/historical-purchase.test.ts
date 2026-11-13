@@ -143,6 +143,79 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
     expect(postCount(fake)).toBe(0);
   });
 
+  it("смешанный документ: товарная и сервисная строки в отдельных таблицах", async () => {
+    const { client } = await setup();
+    const mixed = {
+      ...args,
+      sumIncludesVat: true,
+      documentTotal: 300,
+      lines: [
+        {
+          ...args.lines[0],
+          quantity: 1.5,
+          amount: 150,
+          vatAmount: 30,
+        },
+      ],
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          quantity: 2,
+          price: 50,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          content: "Услуга по договору",
+          sourceLineId: "SRC-S-1",
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+          analytics: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
+          analyticsNu: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
+        },
+      ],
+    };
+    const preview = await call(client, { ...mixed, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      ВидОперации: "Товары",
+      СуммаВключаетНДС: true,
+      СуммаДокумента: 300,
+    });
+    expect((payload["Товары"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      Количество: 1.5,
+      ЕдиницаИзмерения_Key: UNIT,
+      Коэффициент: 1,
+      Склад_Key: "00000000-0000-0000-0000-000000000000",
+    });
+    expect((payload["Услуги"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      Количество: 2,
+      Сумма: 100,
+      СуммаНДС: 20,
+      СчетЗатрат_Key: ACC,
+      СчетЗатратНУ_Key: ACC,
+      СчетУчетаНДС_Key: ACC,
+      ИдентификаторСтроки: "SRC-S-1",
+      Субконто1: NOM,
+      Субконто1_Type: "StandardODATA.Catalog_Номенклатура",
+      СубконтоНУ1: NOM,
+      СубконтоНУ1_Type: "StandardODATA.Catalog_Номенклатура",
+    });
+    const operationId = preview.structuredContent?.operationId;
+    const created = await call(client, { ...mixed, confirm: true, operationId });
+    expect(created.isError, JSON.stringify(created)).toBeFalsy();
+    expect(created.structuredContent?.verifiedFields).toEqual(
+      expect.arrayContaining([
+        "Товары[1].Склад_Key",
+        "Услуги[1].СчетЗатрат_Key",
+        "Услуги[1].СчетЗатратНУ_Key",
+        "Услуги[1].Субконто1_Type",
+        "Услуги[1].СубконтоНУ1_Type",
+      ]),
+    );
+  });
+
   it("подтверждает и полностью проверяет readback", async () => {
     const { client, fake } = await setup();
     const preview = await call(client, { ...args, confirm: false });
