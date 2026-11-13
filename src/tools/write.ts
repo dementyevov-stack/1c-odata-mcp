@@ -131,6 +131,15 @@ const VAT_KIND_VALUES = [
   "ПониженнаяУСНРасчетная",
 ] as const;
 
+/** Значения Enum_СпособыЗаполненияСтавкиНДС из схемы БП 3.0. */
+const VAT_METHOD_VALUES = [
+  "Автоматически",
+  "БезНДС",
+  "ИзКарточкиНоменклатуры",
+  "ОбщаяУСН",
+  "ПониженнаяУСН",
+] as const;
+
 /**
  * Ставки НДС для переноса явных исторических значений из банковской выписки. Список — из
  * Enum_СтавкиНДС БП 3.0, включая ставки до 2019 года и расчётные; неизвестное значение
@@ -2428,7 +2437,11 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "организация, ВИД договора, номер/дата, валюта/тип цен и (опц.) руководитель/подписант. " +
         "ВАЖНО: вид договора (kind) обязателен и его НЕЛЬЗЯ выбирать самостоятельно — " +
         "уточните у пользователя, т.к. один контрагент может быть и покупателем, и поставщиком. " +
-        "Номер по умолчанию «б/н», дата — сегодня. По умолчанию предпросмотр (dry-run); создание — при confirm=true.",
+        "Номер по умолчанию «б/н», дата — сегодня. " +
+        "Исторический opt-in: `emptyNumber`/`emptyDate` явно сохраняют пустые номер/дату без " +
+        "подстановки; при нём проверяются владелец, организация, вид, валюта, флаги и все " +
+        "отправленные поля контрольным GET, а дубль в паре владелец/организация отклоняется. " +
+        "По умолчанию предпросмотр (dry-run); создание — при confirm=true.",
       inputSchema: z.object({
         database: databaseField,
         organization: organizationField,
@@ -2438,6 +2451,13 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           .describe("Вид договора — ОБЯЗАТЕЛЬНО спросить у пользователя, не выбирать самому"),
         number: z.string().optional().describe("Номер договора (по умолчанию «б/н»)"),
         date: z.string().optional().describe("Дата договора YYYY-MM-DD (по умолчанию сегодня)"),
+        code: z.string().trim().min(1).max(100).optional().describe("Исторический Code договора"),
+        sumIncludesVat: z.boolean().optional().describe("Историческое СуммаВключаетНДС"),
+        contractClosed: z.boolean().optional().describe("Историческое ДоговорЗакрыт"),
+        contractSigned: z.boolean().optional().describe("Историческое ДоговорПодписан"),
+        vatMethod: z.enum(VAT_METHOD_VALUES).optional().describe("Историческое СпособЗаполненияСтавкиНДС"),
+        emptyNumber: z.boolean().optional().describe("Исторический opt-in: номер явно пустой, без «б/н»"),
+        emptyDate: z.boolean().optional().describe("Исторический opt-in: дата явно пустая, без текущей даты"),
         name: z.string().optional().describe("Наименование договора (по умолчанию «Договор <номер>»)"),
         currency: z
           .string()
@@ -2466,6 +2486,13 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       kind,
       number,
       date,
+      code,
+      sumIncludesVat,
+      contractClosed,
+      contractSigned,
+      vatMethod,
+      emptyNumber,
+      emptyDate,
       name,
       currency,
       priceType,
@@ -2477,6 +2504,116 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const conn = ctx.db(database);
         const set = await resolveSet(conn, CATALOGS.contracts, "Договоры контрагентов");
         const org = await resolveOrg(conn, organization);
+        const historical =
+          emptyNumber === true ||
+          emptyDate === true ||
+          code !== undefined ||
+          sumIncludesVat !== undefined ||
+          contractClosed !== undefined ||
+          contractSigned !== undefined ||
+          vatMethod !== undefined;
+        if (historical) {
+          if (!name) throw new InputError("Исторический договор требует явное name.");
+          if (emptyNumber && number !== undefined)
+            throw new InputError("emptyNumber нельзя сочетать с number.");
+          if (emptyDate && date !== undefined) throw new InputError("emptyDate нельзя сочетать с date.");
+          const props = new Map(
+            (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          const need = (field: string, type: string): void => {
+            if (props.get(field) !== type)
+              throw new InputError(
+                `Схема договора не публикует ${field} с типом ${type}; историческую запись выполнить нельзя.`,
+              );
+          };
+          for (const [field, type] of [
+            ["Description", "Edm.String"],
+            ["Номер", "Edm.String"],
+            ["Дата", "Edm.DateTime"],
+            ["Owner_Key", "Edm.Guid"],
+            ["Организация_Key", "Edm.Guid"],
+            ["ВидДоговора", "Edm.String"],
+          ] as const)
+            need(field, type);
+          if (code !== undefined) need("Code", "Edm.String");
+          if (sumIncludesVat !== undefined) need("СуммаВключаетНДС", "Edm.Boolean");
+          if (contractClosed !== undefined) need("ДоговорЗакрыт", "Edm.Boolean");
+          if (contractSigned !== undefined) need("ДоговорПодписан", "Edm.Boolean");
+          if (vatMethod !== undefined) need("СпособЗаполненияСтавкиНДС", "Edm.String");
+          need("IsFolder", "Edm.Boolean");
+          need("DeletionMark", "Edm.Boolean");
+          if (currency) {
+            need("ВалютаВзаиморасчетов_Key", "Edm.Guid");
+            need("Валютный", "Edm.Boolean");
+          }
+          if (priceType) need("ТипЦен_Key", "Edm.Guid");
+          if (headName !== undefined) need("РуководительКонтрагента", "Edm.String");
+          if (headPosition !== undefined) need("ДолжностьРуководителяКонтрагента", "Edm.String");
+          if (!GUID_RE.test(counterpartyRef))
+            throw new InputError("counterpartyRef должен быть Ref_Key (GUID).");
+          const cpSet = resolveEntity(CATALOGS.counterparties, await conn.available());
+          if (!cpSet) throw new InputError("Справочник «Контрагенты» не опубликован.");
+          const cp = await conn.client.getEntity(
+            `${cpSet}(${odataGuid(counterpartyRef)})?$format=json&$select=Ref_Key,DeletionMark`,
+          );
+          if (
+            String(cp["Ref_Key"] ?? "")
+              .replace(/[{}]/g, "")
+              .toLowerCase() !== counterpartyRef.toLowerCase()
+          )
+            throw new InputError("Контрагент по указанному Ref_Key не найден.");
+          if (cp.DeletionMark === true) throw new InputError("Контрагент помечен на удаление.");
+          // Дубль в паре владелец/организация: то же наименование и вид договора.
+          const select = ["Ref_Key", "Description", "ВидДоговора", "Owner_Key", "Организация_Key"];
+          let found: ODataEntity[];
+          let truncated: boolean;
+          try {
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              {
+                filter: and(
+                  cmp("Owner_Key", "eq", odataGuid(counterpartyRef)),
+                  cmp("Организация_Key", "eq", odataGuid(org.key)),
+                ),
+                select,
+              },
+              conn.behavior.pageSize,
+              200,
+            );
+            found = read.rows;
+            truncated = read.truncated;
+          } catch (error) {
+            if (!(error instanceof ODataError && error.status === 500)) throw error;
+            const read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              { select },
+              conn.behavior.pageSize,
+              5_000,
+            );
+            found = read.rows;
+            truncated = read.truncated;
+          }
+          if (truncated)
+            throw new InputError("Проверка дубля договора: достигнут предел строк, проход неполный.");
+          const duplicate = found.find(
+            (r) =>
+              String(r["Owner_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() === counterpartyRef.toLowerCase() &&
+              String(r["Организация_Key"] ?? "")
+                .replace(/[{}]/g, "")
+                .toLowerCase() === org.key.toLowerCase() &&
+              String(r["Description"] ?? "").trim() === name.trim() &&
+              String(r["ВидДоговора"] ?? "") === kind,
+          );
+          if (duplicate)
+            throw new InputError(
+              `Договор «${name}» (${kind}) уже существует у этой пары владелец/организация: ` +
+                `${String(duplicate["Ref_Key"] ?? "")}.`,
+            );
+        }
 
         let cur: { ref: string; code?: string } | undefined;
         if (currency)
@@ -2496,8 +2633,13 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
 
         const payload = clean({
           Description: name ?? `Договор ${num}`,
-          Номер: num,
-          Дата: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
+          ...(emptyNumber ? {} : { Номер: num }),
+          ...(emptyDate ? {} : { Дата: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()) }),
+          ...(code !== undefined ? { Code: code } : {}),
+          ...(sumIncludesVat !== undefined ? { СуммаВключаетНДС: sumIncludesVat } : {}),
+          ...(contractClosed !== undefined ? { ДоговорЗакрыт: contractClosed } : {}),
+          ...(contractSigned !== undefined ? { ДоговорПодписан: contractSigned } : {}),
+          ...(vatMethod !== undefined ? { СпособЗаполненияСтавкиНДС: vatMethod } : {}),
           Owner_Key: counterpartyRef,
           ВидДоговора: kind,
           Организация_Key: org.key,
@@ -2506,8 +2648,99 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           РуководительКонтрагента: headName,
           ДолжностьРуководителяКонтрагента: headPosition,
           ...(foreign !== undefined ? { Валютный: foreign } : {}),
+        }) as Record<string, unknown>;
+        if (emptyNumber) payload["Номер"] = "";
+        if (emptyDate) payload["Дата"] = "0001-01-01T00:00:00";
+        let effectivePayload = payload;
+        const created = await createOrPreview(conn, set, payload, confirm, undefined, {
+          prepared: (prepared) => {
+            effectivePayload = prepared;
+          },
         });
-        return createOrPreview(conn, set, payload, confirm);
+        if (!historical || !confirm || created.isError) {
+          if (historical && !confirm)
+            return withStructured(created, {
+              emptyFields: [...(emptyNumber ? ["Номер"] : []), ...(emptyDate ? ["Дата"] : [])],
+              ...(emptyDate
+                ? {
+                    emptyDateNote:
+                      "Дата отправлена как 0001-01-01T00:00:00; контрольный GET проверит это значение.",
+                  }
+                : {}),
+            });
+          return created;
+        }
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+        if (!ref) return created;
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch {
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              { type: "text", text: "Договор создан, но контрольное чтение не удалось; повтор запрещён." },
+            ],
+            structuredContent: { ...createdData, verification: "failed" },
+          };
+        }
+        const fields: Record<string, unknown> = {
+          Description: effectivePayload["Description"],
+          ...(emptyNumber ? { Номер: "" } : { Номер: effectivePayload["Номер"] }),
+          ...(emptyDate ? { Дата: "0001-01-01T00:00:00" } : { Дата: effectivePayload["Дата"] }),
+          ...(code !== undefined ? { Code: code } : {}),
+          ...(sumIncludesVat !== undefined ? { СуммаВключаетНДС: sumIncludesVat } : {}),
+          ...(contractClosed !== undefined ? { ДоговорЗакрыт: contractClosed } : {}),
+          ...(contractSigned !== undefined ? { ДоговорПодписан: contractSigned } : {}),
+          ...(vatMethod !== undefined ? { СпособЗаполненияСтавкиНДС: vatMethod } : {}),
+          IsFolder: false,
+          DeletionMark: false,
+          Owner_Key: counterpartyRef,
+          Организация_Key: org.key,
+          ВидДоговора: kind,
+          ...(cur ? { ВалютаВзаиморасчетов_Key: cur.ref } : {}),
+          ...(pt ? { ТипЦен_Key: pt.ref } : {}),
+          ...(headName !== undefined ? { РуководительКонтрагента: headName } : {}),
+          ...(headPosition !== undefined ? { ДолжностьРуководителяКонтрагента: headPosition } : {}),
+          ...(foreign !== undefined ? { Валютный: foreign } : {}),
+        };
+        const types = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = [];
+        for (const [field, expected] of Object.entries(fields)) {
+          const type = types.get(field) ?? "Edm.String";
+          const ok =
+            field === "Дата" && emptyDate
+              ? String(actual[field] ?? "") === "0001-01-01T00:00:00"
+              : sameStoredValue(expected, actual[field], type);
+          if (!ok) mismatches.push({ field, expected, actual: actual[field] });
+        }
+        if (mismatches.length)
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Договор создан (Ref_Key ${ref}), но контрольное чтение не подтвердило: ` +
+                  `${mismatches.map((m) => m.field).join(", ")}. Повтор запрещён.`,
+              },
+            ],
+            structuredContent: { ...createdData, verification: "failed", mismatches },
+          };
+        return withStructured(created, {
+          verification: "ok",
+          verifiedFields: Object.keys(fields),
+          ...(emptyNumber || emptyDate
+            ? { emptyFields: [...(emptyNumber ? ["Номер"] : []), ...(emptyDate ? ["Дата"] : [])] }
+            : {}),
+        });
       }),
   );
 
