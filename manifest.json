@@ -7526,7 +7526,7 @@
             "type": "boolean"
           },
           "lines": {
-            "minItems": 1,
+            "description": "Товарные позиции документа",
             "type": "array",
             "items": {
               "type": "object",
@@ -7609,6 +7609,12 @@
                   "type": "number",
                   "exclusiveMinimum": 0
                 },
+                "countryOfOriginRef": {
+                  "description": "Ref_Key страны происхождения товара",
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
                 "warehouseEmpty": {
                   "description": "Opt-in: склад строки пустой (склад только в шапке)",
                   "type": "boolean"
@@ -7619,8 +7625,7 @@
                 "quantity",
                 "price"
               ]
-            },
-            "description": "Товарные позиции документа"
+            }
           },
           "serviceLines": {
             "description": "Сервисные позиции в отдельной таблице «Услуги»",
@@ -7775,8 +7780,7 @@
           }
         },
         "required": [
-          "counterpartyRef",
-          "lines"
+          "counterpartyRef"
         ],
         "$schema": "https://json-schema.org/draft/2020-12/schema"
       },

@@ -11,6 +11,7 @@ const WH = "44444444-4444-4444-8444-444444444444";
 const NOM = "55555555-5555-4555-8555-555555555555";
 const ACC = "11111111-1111-4111-8111-111111111111";
 const UNIT = "66666666-6666-4666-8666-666666666666";
+const COUNTRY = "77777777-7777-4777-8777-777777777777";
 const DOC = "99999999-9999-4999-8999-999999999999";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -102,6 +103,7 @@ const args = {
       vatAccountRef: ACC,
       unitRef: UNIT,
       coefficient: 1,
+      countryOfOriginRef: COUNTRY,
       warehouseEmpty: true,
     },
   ],
@@ -138,6 +140,7 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
       СчетУчетаНДС_Key: ACC,
       ЕдиницаИзмерения_Key: UNIT,
       Коэффициент: 1,
+      СтранаПроисхождения_Key: COUNTRY,
       Склад_Key: "00000000-0000-0000-0000-000000000000",
     });
     expect(postCount(fake)).toBe(0);
@@ -187,6 +190,7 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
       Количество: 1.5,
       ЕдиницаИзмерения_Key: UNIT,
       Коэффициент: 1,
+      СтранаПроисхождения_Key: COUNTRY,
       Склад_Key: "00000000-0000-0000-0000-000000000000",
     });
     expect((payload["Услуги"] as Array<Record<string, unknown>>)[0]).toMatchObject({
@@ -214,6 +218,51 @@ describe("write.purchase.create_purchase: исторический opt-in", () =
         "Услуги[1].СубконтоНУ1_Type",
       ]),
     );
+  });
+
+  it("вид «Услуги» без таблицы «Товары» и с пустым складом шапки", async () => {
+    const { client } = await setup();
+    const serviceOnly = {
+      ...args,
+      lines: undefined,
+      warehouse: undefined,
+      sumIncludesVat: true,
+      documentTotal: 120,
+      serviceLines: [
+        {
+          nomenclatureRef: NOM,
+          quantity: 1,
+          price: 100,
+          amount: 100,
+          vatRate: "НДС20",
+          vatAmount: 20,
+          content: "Услуга",
+          sourceLineId: "SRC-SVC",
+          costAccountRef: ACC,
+          costAccountNuRef: ACC,
+          vatAccountRef: ACC,
+          analytics: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
+          analyticsNu: [{ ref: NOM, type: "StandardODATA.Catalog_Номенклатура" }],
+        },
+      ],
+    };
+    const preview = await call(client, { ...serviceOnly, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const payload = preview.structuredContent?.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      ВидОперации: "Услуги",
+      Склад_Key: "00000000-0000-0000-0000-000000000000",
+      СуммаДокумента: 120,
+    });
+    expect(payload).not.toHaveProperty("Товары");
+    expect((payload["Услуги"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      Сумма: 100,
+      СуммаНДС: 20,
+      ИдентификаторСтроки: "SRC-SVC",
+    });
+    const operationId = preview.structuredContent?.operationId;
+    const created = await call(client, { ...serviceOnly, confirm: true, operationId });
+    expect(created.isError, JSON.stringify(created)).toBeFalsy();
   });
 
   it("подтверждает и полностью проверяет readback", async () => {
