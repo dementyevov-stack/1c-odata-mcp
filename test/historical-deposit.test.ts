@@ -127,6 +127,57 @@ describe("write.money.create_payment: исторический Депозит", 
     expect(postCount(fake)).toBe(0);
   });
 
+  it("пустая ставка НДС передаётся явно и проверяется", async () => {
+    const { client } = await setup({
+      readback: {
+        ...readback,
+        РасшифровкаПлатежа: [
+          {
+            LineNumber: 1,
+            СуммаПлатежа: 100,
+            СтатьяДвиженияДенежныхСредств_Key: DDS,
+            СтавкаНДС: "",
+            СуммаНДС: 0,
+          },
+        ],
+      },
+    });
+    const emptyArgs = { ...args, vatRate: "" };
+    const preview = await call(client, { ...emptyArgs, confirm: false });
+    expect(preview.isError, JSON.stringify(preview)).toBeFalsy();
+    const rows = (preview.structuredContent?.payload as Record<string, unknown>)[
+      "РасшифровкаПлатежа"
+    ] as Array<Record<string, unknown>>;
+    expect(rows[0]).toHaveProperty("СтавкаНДС", "");
+    const created = await call(client, {
+      ...emptyArgs,
+      confirm: true,
+      operationId: preview.structuredContent?.operationId,
+    });
+    expect(created.isError, JSON.stringify(created)).toBeFalsy();
+  });
+
+  it("подставленная НДС20/БезНДС или непустые ссылки ломают readback", async () => {
+    for (const bad of [
+      { ...readback, РасшифровкаПлатежа: [{ ...readback.РасшифровкаПлатежа[0], СтавкаНДС: "БезНДС" }] },
+      {
+        ...readback,
+        РасшифровкаПлатежа: [{ ...readback.РасшифровкаПлатежа[0], ДоговорКонтрагента_Key: ACC }],
+      },
+      { ...readback, ДоговорКонтрагента_Key: ACC },
+    ]) {
+      const { client } = await setup({ readback: bad });
+      const preview = await call(client, { ...args, vatRate: "", confirm: false });
+      const created = await call(client, {
+        ...args,
+        vatRate: "",
+        confirm: true,
+        operationId: preview.structuredContent?.operationId,
+      });
+      expect(created.isError).toBe(true);
+    }
+  });
+
   it("подтверждает и полностью проверяет readback", async () => {
     const { client, fake } = await setup({ readback });
     const preview = await call(client, { ...args, confirm: false });

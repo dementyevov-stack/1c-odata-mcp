@@ -3758,6 +3758,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           СтатьяДвиженияДенежныхСредств_Key: rowCashflowItemRef,
           ...(vatRate !== undefined ? { СтавкаНДС: vatRate } : {}),
         });
+        // clean глобально отбрасывает "", а для истории пустая ставка должна уйти явно.
+        if (vatRate === "") row["СтавкаНДС"] = "";
         const payload = clean({
           Date: odataDate(docDate),
           Number: number.trim(),
@@ -3848,7 +3850,19 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             if (!sameStoredValue(value, r[field], "Edm.String")) mismatch.push(`РасшифровкаПлатежа.${field}`);
           if (r["СуммаНДС"] != null && Number(r["СуммаНДС"]) !== 0)
             mismatch.push("РасшифровкаПлатежа.СуммаНДС");
+          const emptyRef = (v: unknown): boolean =>
+            v == null || v === "" || String(v).replace(/[{}]/g, "").toLowerCase() === EMPTY_GUID;
+          if (!emptyRef(r["ДоговорКонтрагента_Key"]))
+            mismatch.push("РасшифровкаПлатежа.ДоговорКонтрагента_Key");
+          if (!emptyRef(r["СчетУчетаРасчетовСКонтрагентом_Key"]))
+            mismatch.push("РасшифровкаПлатежа.СчетУчетаРасчетовСКонтрагентом_Key");
+          if (!emptyRef(r["СчетУчетаРасчетовПоАвансам_Key"]))
+            mismatch.push("РасшифровкаПлатежа.СчетУчетаРасчетовПоАвансам_Key");
         }
+        const emptyHeaderRef = (v: unknown): boolean =>
+          v == null || v === "" || String(v).replace(/[{}]/g, "").toLowerCase() === EMPTY_GUID;
+        if (!emptyHeaderRef(actual["Контрагент"])) mismatch.push("Контрагент");
+        if (!emptyHeaderRef(actual["ДоговорКонтрагента_Key"])) mismatch.push("ДоговорКонтрагента_Key");
         if (mismatch.length)
           return {
             ...created,
