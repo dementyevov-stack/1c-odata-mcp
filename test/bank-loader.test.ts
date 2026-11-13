@@ -13,6 +13,7 @@ import {
   ensureAccount,
   PAYMENT_TOOL,
   runPackage,
+  type ToolClient,
 } from "../src/bank-loader/runner.js";
 import type { SourceDocument, TargetRequisites } from "../src/bank-loader/types.js";
 
@@ -356,6 +357,36 @@ describe("подготовка оплаты покупателя", () => {
     expect(resumed.documents[0]?.ref).toBeTruthy();
     expect(postCount(fake)).toBe(1);
     expect(await journal.get(source.sourceKey)).toMatchObject({ state: "created" });
+  });
+
+  it("брошенный transport timeout после POST не даёт новый operationId и дубль", async () => {
+    const { client, fake, journal } = await fixture();
+    const prepared = await runPackage(client, target, [source], journal, { confirm: false });
+    const operationId = prepared.documents[0]?.operationId;
+    expect(operationId).toBeTruthy();
+    let threw = false;
+    const flaky: ToolClient = {
+      callTool: async (input) => {
+        if (input.name === PAYMENT_TOOL && input.arguments?.["confirm"] === true && !threw) {
+          await client.callTool(input as never);
+          threw = true;
+          throw new Error("MCP error -32001: Request timed out");
+        }
+        return client.callTool(input as never);
+      },
+    };
+    const confirmed = await runPackage(flaky, target, [source], journal, { confirm: true });
+    expect(confirmed.documents[0]?.action).toBe("unknown");
+    expect(postCount(fake)).toBe(1);
+    const unknownEntry = (await journal.get(source.sourceKey))!;
+    expect(unknownEntry.state).toBe("unknown");
+    expect(unknownEntry.operationId).toBe(operationId);
+
+    const recovered = await runPackage(flaky, target, [source], journal, { confirm: false });
+    expect(recovered.documents[0]?.action).toBe("reconciled");
+    expect(recovered.documents[0]?.operationId).toBe(operationId);
+    expect(postCount(fake)).toBe(1);
+    expect((await journal.get(source.sourceKey))?.state).toBe("created");
   });
 
   it("потерянный POST: отличие только во времени документа ловится сверкой", async () => {

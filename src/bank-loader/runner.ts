@@ -70,8 +70,11 @@ const guarded = async (
   try {
     return asResult(await client.callTool({ name, arguments: args }));
   } catch (error) {
+    // Брошенный транспортный сбой (таймаут/обрыв) не доказывает, что запись не ушла:
+    // помечаем исход неизвестным, чтобы подтверждение нельзя было закрыть как rejected.
     return {
       isError: true,
+      _meta: { [ERROR_KIND_META]: "unknown" },
       content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
     };
   }
@@ -388,15 +391,7 @@ const DEFINITIVE = new Set([
   "busy",
   "overflow",
 ]);
-const UNKNOWN_AFTER_SEND = new Set([
-  "unknown",
-  "timeout",
-  "network",
-  "server",
-  "parse",
-  "rate_limit",
-  "internal",
-]);
+
 const looksUnknown = (text: string): boolean =>
   /Результат записи.*неизвестен|Повторная отправка заблокирована|ответ потерян/i.test(text);
 
@@ -942,8 +937,9 @@ async function runOne(
       };
     }
     const kind = kindOf(created) ?? "";
-    const definitive =
-      DEFINITIVE.has(kind) || (!UNKNOWN_AFTER_SEND.has(kind) && !looksUnknown(textOf(created)) && !kind);
+    // Положительное доказательство отказа: известный вид ошибки, при котором запись не ушла.
+    // Без errorKind (например, -32001 timeout) исход неизвестен, даже если текст не похож на timeout.
+    const definitive = kind !== "" && DEFINITIVE.has(kind) && !looksUnknown(textOf(created));
     const note = bounded(textOf(created) || "Запись отклонена.");
     await journal.put(
       entryFor(source, sourceHash, operationId, attempt, definitive ? "rejected" : "unknown", {
