@@ -149,7 +149,7 @@ function valueFor(name: string, s: Schema): unknown {
   if (/Ref$|^ref$/.test(name)) return id;
   if (name === "month") return "2026-09";
   if (/^(from|date|asOf|incomingDate|documentDate)$/.test(name)) return "2026-09-01";
-  if (name === "time") return "12:00:00";
+  if (/^(time|incomingTime)$/.test(name)) return "12:00:00";
   if (name === "to") return "2026-09-30";
   if (name === "accountNumber") return "40702810000000000001";
   if (name === "bik") return "044525225";
