@@ -577,38 +577,107 @@ export function createServer(ctx: ServerContext): McpServer {
           const conn = ctx.db(typeof args.database === "string" ? args.database : undefined);
           const settled = await conn.client.operationSettled(operationId, requestHash);
           if (settled) {
-            replay = ok({
-              ...(isCreateTool ? { created: true } : { updated: true }),
-              ...(name === "write.document.post_document"
-                ? {
-                    done: true,
-                    action: args.post ? "Post" : "Unpost",
-                    verified: false,
-                    verificationScope: "journal_receipt",
-                    readbackFetched: false,
-                    accountingMovementsVerified: false,
-                    readbackNote:
-                      "Журнал хранит только квитанцию; полный документ и проводки повторно не читались.",
-                  }
-                : {}),
-              // Правка банковского документа отдаёт документ из контрольного чтения (#50); повтор — нет.
-              ...(BANK_DOCUMENT_TOOLS.has(name)
-                ? {
-                    verified: false,
-                    verificationScope: "journal_receipt",
-                    readbackFetched: false,
-                    readbackNote: "Журнал хранит только квитанцию; документ повторно не читался.",
-                  }
-                : {}),
-              replayed: true,
-              note: "Операция с этим operationId уже выполнена; повторный запрос в 1С не отправлялся.",
-              database: conn.cfg.name,
-              entitySet: settled.entitySet,
-              ref: settled.result["Ref_Key"],
-              ...(settled.result["RecordPath"] ? { recordPath: settled.result["RecordPath"] } : {}),
-              ...(settled.result["Code"] ? { code: settled.result["Code"] } : {}),
-              operationId,
-            });
+            if (settled.verification === "pending") {
+              replay = {
+                isError: true,
+                _meta: { "odata-1c/errorKind": "unknown" },
+                content: [
+                  {
+                    type: "text",
+                    text: `Операция ${operationId} записана, но readback не завершён; outcome=unknown, повторный POST не выполнялся.`,
+                  },
+                ],
+                structuredContent: {
+                  created: true,
+                  replayed: true,
+                  operationId,
+                  entitySet: settled.entitySet,
+                  ref: settled.result["Ref_Key"],
+                  verification: "pending",
+                  outcome: "unknown",
+                  note: "Квитанция требует контрольного чтения; успех не подтверждён, POST не повторялся.",
+                },
+              };
+            } else if (settled.verification === "failed") {
+              replay = {
+                isError: true,
+                _meta: { "odata-1c/errorKind": "refused" },
+                content: [
+                  {
+                    type: "text",
+                    text: settled.verificationError
+                      ? `Предыдущее подтверждение operationId ${operationId} записано, но readback не прошёл: ${settled.verificationError}. Повторный POST не выполнялся.`
+                      : `Предыдущее подтверждение operationId ${operationId} записано, но readback не прошёл. Повторный POST не выполнялся.`,
+                  },
+                ],
+                structuredContent: {
+                  created: true,
+                  replayed: true,
+                  operationId,
+                  entitySet: settled.entitySet,
+                  ref: settled.result["Ref_Key"],
+                  verification: "failed",
+                  note: "Журнал хранит failed readback; успех не подтверждён, POST не повторялся.",
+                },
+              };
+            } else if (
+              name === "write.sales.create_issued_invoice" &&
+              settled.verification === undefined &&
+              settled.verificationRequired !== false
+            ) {
+              replay = {
+                isError: true,
+                _meta: { "odata-1c/errorKind": "unknown" },
+                content: [
+                  {
+                    type: "text",
+                    text: `Квитанция operationId ${operationId} не содержит результата readback; outcome=unverified, повторный POST не выполнялся.`,
+                  },
+                ],
+                structuredContent: {
+                  created: true,
+                  replayed: true,
+                  operationId,
+                  entitySet: settled.entitySet,
+                  ref: settled.result["Ref_Key"],
+                  verification: "unverified",
+                  outcome: "unknown",
+                  note: "Старая квитанция без readback: документ не объявляется проверенным, POST не повторялся.",
+                },
+              };
+            } else
+              replay = ok({
+                ...(isCreateTool ? { created: true } : { updated: true }),
+                ...(name === "write.document.post_document"
+                  ? {
+                      done: true,
+                      action: args.post ? "Post" : "Unpost",
+                      verified: false,
+                      verificationScope: "journal_receipt",
+                      readbackFetched: false,
+                      accountingMovementsVerified: false,
+                      readbackNote:
+                        "Журнал хранит только квитанцию; полный документ и проводки повторно не читались.",
+                    }
+                  : {}),
+                // Правка банковского документа отдаёт документ из контрольного чтения (#50); повтор — нет.
+                ...(BANK_DOCUMENT_TOOLS.has(name)
+                  ? {
+                      verified: false,
+                      verificationScope: "journal_receipt",
+                      readbackFetched: false,
+                      readbackNote: "Журнал хранит только квитанцию; документ повторно не читался.",
+                    }
+                  : {}),
+                replayed: true,
+                note: "Операция с этим operationId уже выполнена; повторный запрос в 1С не отправлялся.",
+                database: conn.cfg.name,
+                entitySet: settled.entitySet,
+                ref: settled.result["Ref_Key"],
+                ...(settled.result["RecordPath"] ? { recordPath: settled.result["RecordPath"] } : {}),
+                ...(settled.result["Code"] ? { code: settled.result["Code"] } : {}),
+                operationId,
+              });
           }
           return ok({});
         });
