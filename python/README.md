@@ -51,3 +51,29 @@ assert result.status in {"existing", "created", "patched", "unknown", "conflict"
 ```bash
 python3 -m unittest discover -s python/tests -v
 ```
+
+## Проверка существующей записи регистра
+
+`accounting_register.verify_existing_register_record(transport, ...)` — отдельный
+гейт для уже существующей записи. Он делает только точечный GET по паре
+`Recorder`/`Recorder_Type`, не читает список `AccountingRegister_Example` как
+источник истины и никогда не вызывает `POST`.
+
+```python
+from accounting_register import verify_existing_register_record
+
+row = verify_existing_register_record(
+    transport,                       # get_by_recorder(key, type) -> row | None
+    recorder_key=recorder_key,
+    recorder_type="StandardODATA.Document_Example",
+    record_type="StandardODATA.AccountingRegister_Example_RowType",
+    expected={"Recorder": recorder_key, "Amount": 100},
+    empty_resources=("EmptyResource",),  # только это поле, не все ресурсы
+)
+```
+
+`empty_resources` — узкий allowlist: поле обязано присутствовать, допускаются
+только `None`, `int(0)`, `float(0.0)`; `False` отклоняется. Неверный
+`Recorder_Type`, неполный `_RecordType`, отсутствующее свойство ресурса или
+иное значение — `RegisterRecordMismatch`; пустой ответ точечного GET —
+`RegisterRecordUnknown`. Оба случая не создают запись.
