@@ -49,6 +49,11 @@ export interface JournalEntry {
   check?: OperationCheck;
   /** Ref_Key, который MCP задаёт создаваемому объекту: по нему сверка — простым GET. */
   refKey?: string;
+  /** Результат контрольного чтения после записи; replay не должен выдавать failed за успех. */
+  verification?: "pending" | "ok" | "failed";
+  verificationError?: string;
+  /** Профиль требует readback; false у новых обычных квитанций, absent у старых. */
+  verificationRequired?: boolean;
 }
 
 /**
@@ -74,6 +79,7 @@ export class WriteOperationJournal {
     payload: Record<string, unknown>,
     requestHash: string,
     refKey?: string,
+    verificationRequired = false,
   ): Promise<void> {
     this.validateOperationId(operationId);
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
@@ -91,6 +97,8 @@ export class WriteOperationJournal {
       createdAt: now,
       updatedAt: now,
       ...(refKey ? { refKey } : {}),
+      verificationRequired,
+      ...(verificationRequired ? { verification: "pending" as const } : {}),
     };
 
     try {
@@ -214,7 +222,12 @@ export class WriteOperationJournal {
       if (!file.endsWith(".json")) continue;
       try {
         const entry = JSON.parse(await readFile(join(this.directory, file), "utf8")) as JournalEntry;
-        if (entry.state === "executing" || entry.state === "outcome_unknown")
+        if (
+          entry.state === "executing" ||
+          entry.state === "outcome_unknown" ||
+          (entry.state === "succeeded" &&
+            (entry.verification === "pending" || entry.verification === "failed"))
+        )
           uncertain.push(entry.operationId);
       } catch {
         uncertain.push(file.slice(0, -".json".length));
@@ -256,6 +269,39 @@ export class WriteOperationJournal {
     await rm(this.lockPath(operationId), { force: true }).catch(() => undefined);
   }
 
+  /** До POST помечает pending; повторный вызов не откатывает succeeded/outcome_unknown. */
+  async markVerificationPending(operationId: string): Promise<void> {
+    const lockPath = this.lockPath(operationId);
+    let lock: Awaited<ReturnType<typeof open>>;
+    try {
+      lock = await open(lockPath, "wx", 0o600);
+    } catch (error) {
+      if (isNodeError(error, "EEXIST")) return; // execute уже владеет операцией
+      throw error;
+    }
+    try {
+      const entry = await this.read(operationId);
+      if (entry.state !== "prepared") return;
+      if (entry.verification === "pending") return;
+      await this.replace({ ...entry, verification: "pending", updatedAt: new Date().toISOString() });
+    } finally {
+      await lock.close().catch(() => undefined);
+      await rm(lockPath, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /** Сохраняет результат readback, чтобы повтор operationId не терял failed. */
+  async recordVerification(operationId: string, status: "ok" | "failed", error?: string): Promise<void> {
+    const entry = await this.read(operationId);
+    if (entry.state !== "succeeded") return;
+    await this.replace({
+      ...entry,
+      verification: status,
+      ...(status === "failed" && error ? { verificationError: boundedMessage(error) } : {}),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
   /**
    * Сверка показала, что запись до 1С не дошла (документ в исходном состоянии):
    * операция закрывается как неприменённая, повтор по этому id запрещён — нужен новый предпросмотр.
@@ -280,7 +326,15 @@ export class WriteOperationJournal {
   async settled(
     operationId: string,
     requestHash: string,
-  ): Promise<{ entitySet: string; result: Record<string, string> } | undefined> {
+  ): Promise<
+    | {
+        entitySet: string;
+        result: Record<string, string>;
+        verification?: "pending" | "ok" | "failed";
+        verificationError?: string;
+      }
+    | undefined
+  > {
     const entry = await this.lookup(operationId);
     if (!entry || entry.state === "prepared") return undefined;
     if (entry.database !== this.database || entry.requestHash !== requestHash) {
@@ -289,7 +343,15 @@ export class WriteOperationJournal {
       );
     }
     this.resultForExisting(entry); // неизвестный/отклонённый исход — ошибкой
-    return { entitySet: entry.entitySet, result: entry.result ?? {} };
+    return {
+      entitySet: entry.entitySet,
+      result: entry.result ?? {},
+      ...(entry.verification ? { verification: entry.verification } : {}),
+      ...(entry.verificationError ? { verificationError: entry.verificationError } : {}),
+      ...(entry.verificationRequired !== undefined
+        ? { verificationRequired: entry.verificationRequired }
+        : {}),
+    };
   }
 
   private resultForExisting<T extends ODataEntity>(entry: JournalEntry): T | undefined {
@@ -430,7 +492,11 @@ export class WriteOperationJournal {
           try {
             const entry = JSON.parse(await readFile(join(this.directory, file), "utf8")) as JournalEntry;
             const age = now - Date.parse(entry.updatedAt);
-            const uncertain = entry.state === "executing" || entry.state === "outcome_unknown";
+            const uncertain =
+              entry.state === "executing" ||
+              entry.state === "outcome_unknown" ||
+              (entry.state === "succeeded" &&
+                (entry.verification === "pending" || entry.verification === "failed"));
             if (age > (uncertain ? UNCERTAIN_RETENTION_MS : TERMINAL_RETENTION_MS)) {
               await remove(file);
               await remove(`${id}.lock`);

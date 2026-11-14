@@ -11004,7 +11004,7 @@
     {
       "name": "write.sales.create_issued_invoice",
       "title": "Создать счёт-фактуру выданный",
-      "description": "Создаёт «Счёт-фактура выданный» НА ОСНОВАНИИ реализации (или иного документа отгрузки). Реквизиты (организация, контрагент, договор, суммы, НДС) наследуются от документа-основания. НЕПРОВЕДЁННЫЙ; провести — post_document. dry-run/confirm.",
+      "description": "Создаёт «Счёт-фактура выданный» на основании реализации (или иного документа отгрузки). Обычный режим наследует реквизиты основания. Исторический opt-in: явные Number/Date со временем, дата выставления, вид СФ (реализация/аванс), код операции, точные типизированные основания и платёжно-расчётные документы, суммы/НДС, полный readback и диагностика отказа без повторного POST. НЕПРОВЕДЁННЫЙ; dry-run/confirm.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -11013,20 +11013,345 @@
             "type": "string"
           },
           "baseDocumentRef": {
-            "type": "string",
-            "description": "Ref_Key документа-основания (реализация товаров и услуг)"
+            "description": "Ref_Key документа-основания (обычный режим)",
+            "type": "string"
           },
           "baseDocumentEntity": {
-            "description": "Имя набора документа-основания, если это не «Реализация…» (напр. Document_ОтчетКомитентуОПродажах)",
+            "description": "Имя набора документа-основания, если это не «Реализация…»",
             "type": "string"
           },
           "operationCode": {
-            "description": "Код вида операции (по умолчанию 01)",
+            "description": "Код вида операции (обычный режим: 01)",
             "type": "string"
           },
           "date": {
-            "description": "Дата и дата выставления YYYY-MM-DD (по умолчанию сегодня)",
+            "description": "Дата и дата выставления YYYY-MM-DD (обычный режим)",
             "type": "string"
+          },
+          "number": {
+            "description": "Исторический номер документа",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "time": {
+            "description": "Точное время документа HH:MM:SS",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "issueDate": {
+            "description": "Дата выставления YYYY-MM-DD",
+            "type": "string"
+          },
+          "issueTime": {
+            "description": "Точное время выставления HH:MM:SS",
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+          },
+          "invoiceKind": {
+            "description": "Вид счёта-фактуры",
+            "type": "string",
+            "enum": [
+              "НаРеализацию",
+              "НаАванс"
+            ]
+          },
+          "basisDocuments": {
+            "description": "Точные документы основания",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ref": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Ref_Key документа-основания"
+                },
+                "type": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "Тип ссылки основания"
+                },
+                "lineNumber": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "sourceNumber": {
+                  "description": "Номер исходного документа",
+                  "type": "string"
+                },
+                "sourceDate": {
+                  "description": "Дата исходного документа YYYY-MM-DD",
+                  "type": "string"
+                },
+                "considerCorrection": {
+                  "description": "УчитыватьИсправлениеИсходногоДокумента; false сохраняется явно",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "ref",
+                "type"
+              ]
+            }
+          },
+          "paymentDocuments": {
+            "description": "Точные платёжно-расчётные документы (для аванса)",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "number": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                "date": {
+                  "type": "string",
+                  "description": "YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS"
+                },
+                "invoiceNumber": {
+                  "type": "string"
+                },
+                "invoiceDate": {
+                  "description": "YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "number",
+                "date"
+              ]
+            }
+          },
+          "advanceRows": {
+            "description": "Историческая таблица «Авансы»",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "nomenclatureRef": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "content": {
+                  "type": "string"
+                },
+                "amount": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "vatRate": {
+                  "type": "string",
+                  "enum": [
+                    "БезНДС",
+                    "НДС0",
+                    "НДС5",
+                    "НДС5_105",
+                    "НДС7",
+                    "НДС7_107",
+                    "НДС10",
+                    "НДС10_110",
+                    "НДС18",
+                    "НДС18_118",
+                    "НДС20",
+                    "НДС20_120",
+                    "НДС22",
+                    "НДС22_122"
+                  ]
+                },
+                "vatAmount": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "counterpartyRef": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "basisRef": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "basisType": {
+                  "type": "string"
+                },
+                "basisEmpty": {
+                  "description": "Явно пустые ДокументОснование/Тип",
+                  "type": "boolean"
+                },
+                "paymentDate": {
+                  "type": "string"
+                },
+                "paymentNumber": {
+                  "type": "string"
+                },
+                "sellerInvoiceNumber": {
+                  "type": "string"
+                },
+                "correctionRef": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "amountBeforeCorrection": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "vatRateBeforeCorrection": {
+                  "type": "string",
+                  "enum": [
+                    "БезНДС",
+                    "НДС0",
+                    "НДС5",
+                    "НДС5_105",
+                    "НДС7",
+                    "НДС7_107",
+                    "НДС10",
+                    "НДС10_110",
+                    "НДС18",
+                    "НДС18_118",
+                    "НДС20",
+                    "НДС20_120",
+                    "НДС22",
+                    "НДС22_122"
+                  ]
+                },
+                "vatAmountBeforeCorrection": {
+                  "type": "number",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "nomenclatureRef",
+                "amount",
+                "vatRate",
+                "vatAmount"
+              ]
+            }
+          },
+          "emptyShipmentDocuments": {
+            "description": "Передать явно пустую ДокументыОбОтгрузке=[] (только пустой массив)",
+            "type": "array",
+            "items": {
+              "not": {}
+            }
+          },
+          "emptyCorrectableLineNumbers": {
+            "description": "Передать явно пустую КорректируемыеНомераСтрок=[] (только пустой массив)",
+            "type": "array",
+            "items": {
+              "not": {}
+            }
+          },
+          "sumTotal": {
+            "description": "Явная сумма документа",
+            "type": "number",
+            "minimum": 0
+          },
+          "sumVat": {
+            "description": "Явная сумма НДС документа",
+            "type": "number",
+            "minimum": 0
+          },
+          "contractRef": {
+            "description": "Явный договор шапки; zero GUID — пусто",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "currencyRef": {
+            "description": "ВалютаДокумента_Key",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "responsibleRef": {
+            "description": "Руководитель_Key",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "chiefAccountantRef": {
+            "description": "ГлавныйБухгалтер_Key",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "invoiceForPaymentRef": {
+            "description": "СчетНаОплату_Key",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "comment": {
+            "description": "Точный Комментарий исторического профиля",
+            "type": "string"
+          },
+          "numberRepresentation": {
+            "description": "ПредставлениеНомера",
+            "type": "string"
+          },
+          "headerPaymentNumber": {
+            "description": "НомерПлатежноРасчетногоДокумента шапки",
+            "type": "string"
+          },
+          "headerVatRate": {
+            "description": "СтавкаНДС шапки",
+            "type": "string"
+          },
+          "headerPaymentDate": {
+            "description": "ДатаПлатежноРасчетногоДокумента шапки",
+            "type": "string"
+          },
+          "issued": {
+            "description": "Выставлен",
+            "type": "boolean"
+          },
+          "invoiceNotIssued": {
+            "description": "СчетФактураНеВыставляется",
+            "type": "boolean"
+          },
+          "invoiceWithoutVat": {
+            "description": "СчетФактураБезНДС",
+            "type": "boolean"
+          },
+          "manualCorrection": {
+            "description": "РучнаяКорректировка",
+            "type": "boolean"
+          },
+          "correction": {
+            "description": "Исправление",
+            "type": "boolean"
+          },
+          "sub0": {
+            "description": "Под0",
+            "type": "boolean"
+          },
+          "initialBalanceVat": {
+            "description": "СформированПриВводеНачальныхОстатковНДС",
+            "type": "boolean"
+          },
+          "representationMethod": {
+            "description": "КодСпособаВыставления",
+            "type": "integer",
+            "minimum": -32768,
+            "maximum": 32767
+          },
+          "sum": {
+            "description": "Явная Сумма шапки",
+            "type": "number",
+            "minimum": 0
+          },
+          "vat": {
+            "description": "Явная СуммаНДС шапки",
+            "type": "number",
+            "minimum": 0
           },
           "confirm": {
             "default": false,
@@ -11040,9 +11365,6 @@
             "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
           }
         },
-        "required": [
-          "baseDocumentRef"
-        ],
         "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
       "outputSchema": {

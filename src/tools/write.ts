@@ -12,6 +12,7 @@ import { ok, fail, guard, databaseField, organizationField, renderJson } from ".
 import { CATALOGS, WRITE_DOCUMENTS, resolveEntity } from "../config/mapping.js";
 import { resolveOrgOrDefault, resolveOrganizationByRequisites } from "../odata/orgs.js";
 import { ensurePublished, requireEntity } from "../odata/publication.js";
+import { buildHistoricalFields, compareHistoricalFields } from "../odata/historical-fields.js";
 import {
   accountsByCode,
   accountsByRef,
@@ -1575,18 +1576,26 @@ async function createOrPreview(
     settlementSide?: SettlementSide;
     /** Итоговый payload после договора/счетов/метки — для контрольного чтения конкретного инструмента. */
     prepared?: (payload: Record<string, unknown>) => void;
+    /** Квитанция без readback не считается успехом (durable pending). */
+    verificationRequired?: boolean;
+    /** Не добавлять/не чистить служебную метку операции в Комментарии. */
+    preserveComment?: boolean;
   },
 ): Promise<CallToolResult> {
   const contract = await withDefaultContract(conn, entitySet, payload);
   const settlement = opts?.keepSettlement
     ? { payload: contract.payload, notes: [] }
     : await withSettlementAccounts(conn, entitySet, contract.payload, opts?.settlementSide);
-  payload = await withOperationMarker(conn, entitySet, settlement.payload);
+  payload = opts?.preserveComment
+    ? settlement.payload
+    : await withOperationMarker(conn, entitySet, settlement.payload);
   opts?.prepared?.(payload);
   const allNotes = [...(notes ?? []), ...contract.notes, ...settlement.notes];
   const extra = allNotes.length ? { notes: allNotes } : {};
   if (!confirm) {
-    await conn.client.prepareCreate(entitySet, payload);
+    await conn.client.prepareCreate(entitySet, payload, {
+      verificationRequired: opts?.verificationRequired === true,
+    });
     return ok({
       dryRun: true,
       database: conn.cfg.name,
@@ -1924,6 +1933,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           return ok({
             ...common,
             status: "succeeded",
+            ...(entry.verification ? { verification: entry.verification } : {}),
             ref: entry.result?.["Ref_Key"],
             number: entry.result?.["Number"],
             ...(entry.result?.["RecordPath"] ? { recordPath: entry.result["RecordPath"] } : {}),
@@ -2420,6 +2430,33 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ],
             structuredContent: { ...createdData, verification: "failed", mismatches },
           };
+        {
+          const okOp = currentWriteOperationId();
+          if (okOp) {
+            try {
+              await conn.client.recordOperationVerification(okOp, "ok");
+            } catch {
+              return {
+                ...created,
+                isError: true,
+                _meta: { "odata-1c/errorKind": "unknown" },
+                content: [
+                  {
+                    type: "text",
+                    text: "Счёт-фактура записан, но результат readback не сохранился в журнале; outcome=unknown, повтор запрещён.",
+                  },
+                ],
+                structuredContent: {
+                  ...createdData,
+                  verification: "pending",
+                  outcome: "unknown",
+                  operationId: okOp,
+                  stage: "VERIFY",
+                },
+              };
+            }
+          }
+        }
         return withStructured(created, {
           verification: "ok",
           verifiedFields: Object.keys(expected),
@@ -2787,6 +2824,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ],
             structuredContent: { ...createdData, verification: "failed", mismatches },
           };
+        {
+          const okOp = currentWriteOperationId();
+          if (okOp) await conn.client.recordOperationVerification(okOp, "ok").catch(() => undefined);
+        }
         return withStructured(created, {
           verification: "ok",
           ...(emptyQuantity ? { quantityVerification: "pending_live_validation" } : {}),
@@ -3693,6 +3734,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ],
             structuredContent: { ...createdData, verification: "failed", mismatches },
           };
+        {
+          const okOp = currentWriteOperationId();
+          if (okOp) await conn.client.recordOperationVerification(okOp, "ok").catch(() => undefined);
+        }
         return withStructured(created, {
           verification: "ok",
           verifiedFields: [
@@ -5530,30 +5575,160 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       }),
   );
 
+  const issuedBasisRow = z.object({
+    ref: z.string().uuid().describe("Ref_Key документа-основания"),
+    type: z.string().trim().min(1).max(200).describe("Тип ссылки основания"),
+    lineNumber: z.number().int().positive().optional(),
+    sourceNumber: z.string().optional().describe("Номер исходного документа"),
+    sourceDate: z.string().optional().describe("Дата исходного документа YYYY-MM-DD"),
+    considerCorrection: z
+      .boolean()
+      .optional()
+      .describe("УчитыватьИсправлениеИсходногоДокумента; false сохраняется явно"),
+  });
+  const issuedPaymentRow = z.object({
+    number: z.string().trim().min(1).max(100),
+    date: z.string().describe("YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS"),
+    invoiceNumber: z.string().optional(),
+    invoiceDate: z.string().optional().describe("YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS"),
+  });
+  const issuedAdvanceRow = z.object({
+    nomenclatureRef: z.string().uuid(),
+    content: z.string().optional(),
+    amount: z.number().nonnegative(),
+    vatRate: z.enum(BANK_VAT_RATES),
+    vatAmount: z.number().nonnegative(),
+    counterpartyRef: z.string().uuid().optional(),
+    basisRef: z.string().uuid().optional(),
+    basisType: z.string().optional(),
+    basisEmpty: z.boolean().optional().describe("Явно пустые ДокументОснование/Тип"),
+    paymentDate: z.string().optional(),
+    paymentNumber: z.string().optional(),
+    sellerInvoiceNumber: z.string().optional(),
+    correctionRef: z.string().uuid().optional(),
+    amountBeforeCorrection: z.number().nonnegative().optional(),
+    vatRateBeforeCorrection: z.enum(BANK_VAT_RATES).optional(),
+    vatAmountBeforeCorrection: z.number().nonnegative().optional(),
+  });
+
   server.registerTool(
     "write.sales.create_issued_invoice",
     {
       title: "Создать счёт-фактуру выданный",
       description:
-        "Создаёт «Счёт-фактура выданный» НА ОСНОВАНИИ реализации (или иного документа отгрузки). " +
-        "Реквизиты (организация, контрагент, договор, суммы, НДС) наследуются от документа-основания. " +
-        "НЕПРОВЕДЁННЫЙ; провести — post_document. dry-run/confirm.",
+        "Создаёт «Счёт-фактура выданный» на основании реализации (или иного документа отгрузки). " +
+        "Обычный режим наследует реквизиты основания. Исторический opt-in: явные Number/Date со временем, " +
+        "дата выставления, вид СФ (реализация/аванс), код операции, точные типизированные основания и " +
+        "платёжно-расчётные документы, суммы/НДС, полный readback и диагностика отказа без повторного POST. " +
+        "НЕПРОВЕДЁННЫЙ; dry-run/confirm.",
       inputSchema: z.object({
         database: databaseField,
-        baseDocumentRef: z.string().describe("Ref_Key документа-основания (реализация товаров и услуг)"),
+        baseDocumentRef: z.string().optional().describe("Ref_Key документа-основания (обычный режим)"),
         baseDocumentEntity: z
           .string()
           .optional()
-          .describe(
-            "Имя набора документа-основания, если это не «Реализация…» (напр. Document_ОтчетКомитентуОПродажах)",
-          ),
-        operationCode: z.string().optional().describe("Код вида операции (по умолчанию 01)"),
-        date: z.string().optional().describe("Дата и дата выставления YYYY-MM-DD (по умолчанию сегодня)"),
+          .describe("Имя набора документа-основания, если это не «Реализация…»"),
+        operationCode: z.string().optional().describe("Код вида операции (обычный режим: 01)"),
+        date: z.string().optional().describe("Дата и дата выставления YYYY-MM-DD (обычный режим)"),
+        number: z.string().trim().min(1).max(100).optional().describe("Исторический номер документа"),
+        time: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Точное время документа HH:MM:SS"),
+        issueDate: z.string().optional().describe("Дата выставления YYYY-MM-DD"),
+        issueTime: z
+          .string()
+          .regex(/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/)
+          .optional()
+          .describe("Точное время выставления HH:MM:SS"),
+        invoiceKind: z.enum(["НаРеализацию", "НаАванс"]).optional().describe("Вид счёта-фактуры"),
+        basisDocuments: z.array(issuedBasisRow).optional().describe("Точные документы основания"),
+        paymentDocuments: z
+          .array(issuedPaymentRow)
+          .optional()
+          .describe("Точные платёжно-расчётные документы (для аванса)"),
+        advanceRows: z.array(issuedAdvanceRow).optional().describe("Историческая таблица «Авансы»"),
+        emptyShipmentDocuments: z
+          .array(z.never())
+          .optional()
+          .describe("Передать явно пустую ДокументыОбОтгрузке=[] (только пустой массив)"),
+        emptyCorrectableLineNumbers: z
+          .array(z.never())
+          .optional()
+          .describe("Передать явно пустую КорректируемыеНомераСтрок=[] (только пустой массив)"),
+        sumTotal: z.number().nonnegative().optional().describe("Явная сумма документа"),
+        sumVat: z.number().nonnegative().optional().describe("Явная сумма НДС документа"),
+        contractRef: z.string().uuid().optional().describe("Явный договор шапки; zero GUID — пусто"),
+        currencyRef: z.string().uuid().optional().describe("ВалютаДокумента_Key"),
+        responsibleRef: z.string().uuid().optional().describe("Руководитель_Key"),
+        chiefAccountantRef: z.string().uuid().optional().describe("ГлавныйБухгалтер_Key"),
+        invoiceForPaymentRef: z.string().uuid().optional().describe("СчетНаОплату_Key"),
+        comment: z.string().optional().describe("Точный Комментарий исторического профиля"),
+        numberRepresentation: z.string().optional().describe("ПредставлениеНомера"),
+        headerPaymentNumber: z.string().optional().describe("НомерПлатежноРасчетногоДокумента шапки"),
+        headerVatRate: z.string().optional().describe("СтавкаНДС шапки"),
+        headerPaymentDate: z.string().optional().describe("ДатаПлатежноРасчетногоДокумента шапки"),
+        issued: z.boolean().optional().describe("Выставлен"),
+        invoiceNotIssued: z.boolean().optional().describe("СчетФактураНеВыставляется"),
+        invoiceWithoutVat: z.boolean().optional().describe("СчетФактураБезНДС"),
+        manualCorrection: z.boolean().optional().describe("РучнаяКорректировка"),
+        correction: z.boolean().optional().describe("Исправление"),
+        sub0: z.boolean().optional().describe("Под0"),
+        initialBalanceVat: z.boolean().optional().describe("СформированПриВводеНачальныхОстатковНДС"),
+        representationMethod: z
+          .number()
+          .int()
+          .min(-32768)
+          .max(32767)
+          .optional()
+          .describe("КодСпособаВыставления"),
+        sum: z.number().nonnegative().optional().describe("Явная Сумма шапки"),
+        vat: z.number().nonnegative().optional().describe("Явная СуммаНДС шапки"),
         confirm: confirmField,
       }),
       outputSchema: createResultSchema,
     },
-    ({ database, baseDocumentRef, baseDocumentEntity, operationCode, date, confirm }) =>
+    ({
+      database,
+      baseDocumentRef,
+      baseDocumentEntity,
+      operationCode,
+      date,
+      number,
+      time,
+      issueDate,
+      issueTime,
+      invoiceKind,
+      basisDocuments,
+      paymentDocuments,
+      advanceRows,
+      emptyShipmentDocuments,
+      emptyCorrectableLineNumbers,
+      sumTotal,
+      sumVat,
+      contractRef,
+      currencyRef,
+      responsibleRef,
+      chiefAccountantRef,
+      invoiceForPaymentRef,
+      comment,
+      numberRepresentation,
+      headerPaymentNumber,
+      headerVatRate,
+      headerPaymentDate,
+      issued,
+      invoiceNotIssued,
+      invoiceWithoutVat,
+      manualCorrection,
+      correction,
+      sub0,
+      initialBalanceVat,
+      representationMethod,
+      sum: headerSum,
+      vat: headerVat,
+      confirm,
+    }) =>
       guard("write.sales.create_issued_invoice", async () => {
         const conn = ctx.db(database);
         const set = await requireEntity(
@@ -5561,37 +5736,1017 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           WRITE_DOCUMENTS.issuedInvoice,
           "Документ «Счёт-фактура выданный»",
         );
-        const baseSet =
-          baseDocumentEntity ??
-          (await requireEntity(
-            conn,
-            WRITE_DOCUMENTS.sales,
-            "Документ-основание «Реализация товаров и услуг»",
-          ));
-        const b = await invoiceBasis(conn, baseSet, baseDocumentRef);
-        const d = odataDate(date ? new Date(`${date}T00:00:00`) : new Date());
-        const baseGuid = baseDocumentRef.replace(/[{}']/g, "");
-        const baseRow = clean({
-          LineNumber: 1,
-          ДокументОснование: baseGuid,
-          ДокументОснование_Type: `StandardODATA.${baseSet}`,
+        const historical =
+          number !== undefined ||
+          time !== undefined ||
+          issueDate !== undefined ||
+          issueTime !== undefined ||
+          invoiceKind !== undefined ||
+          basisDocuments !== undefined ||
+          paymentDocuments !== undefined ||
+          advanceRows !== undefined ||
+          emptyShipmentDocuments !== undefined ||
+          emptyCorrectableLineNumbers !== undefined ||
+          sumTotal !== undefined ||
+          sumVat !== undefined ||
+          contractRef !== undefined ||
+          currencyRef !== undefined ||
+          responsibleRef !== undefined ||
+          chiefAccountantRef !== undefined ||
+          invoiceForPaymentRef !== undefined ||
+          comment !== undefined ||
+          numberRepresentation !== undefined ||
+          headerPaymentNumber !== undefined ||
+          headerVatRate !== undefined ||
+          headerPaymentDate !== undefined ||
+          issued !== undefined ||
+          invoiceNotIssued !== undefined ||
+          invoiceWithoutVat !== undefined ||
+          manualCorrection !== undefined ||
+          correction !== undefined ||
+          sub0 !== undefined ||
+          initialBalanceVat !== undefined ||
+          representationMethod !== undefined ||
+          headerSum !== undefined ||
+          headerVat !== undefined;
+        if (!historical) {
+          if (!baseDocumentRef) throw new InputError("Обычный режим требует baseDocumentRef.");
+          const baseSet =
+            baseDocumentEntity ??
+            (await requireEntity(
+              conn,
+              WRITE_DOCUMENTS.sales,
+              "Документ-основание «Реализация товаров и услуг»",
+            ));
+          const b = await invoiceBasis(conn, baseSet, baseDocumentRef);
+          const d = odataDate(date ? new Date(`${date}T00:00:00`) : new Date());
+          const baseGuid = baseDocumentRef.replace(/[{}']/g, "");
+          const baseRow = clean({
+            LineNumber: 1,
+            ДокументОснование: baseGuid,
+            ДокументОснование_Type: `StandardODATA.${baseSet}`,
+          });
+          const payload = clean({
+            Date: d,
+            Posted: false,
+            ВидСчетаФактуры: "НаРеализацию",
+            Организация_Key: b.org,
+            Контрагент_Key: b.counterparty,
+            ДоговорКонтрагента_Key: b.contract,
+            ДокументОснование: baseGuid,
+            ДокументОснование_Type: `StandardODATA.${baseSet}`,
+            ДатаВыставления: d,
+            КодВидаОперации: operationCode ?? "01",
+            СуммаДокумента: b.total,
+            СуммаНДСДокумента: b.vat,
+            ДокументыОснования: [baseRow],
+          });
+          return createOrPreview(conn, set, payload, confirm);
+        }
+        // Исторический режим: ничего не выводим из одной ссылки на банк и не
+        // подставляем вид/дату/код по умолчанию.
+        if (!number) throw new InputError("Исторический счёт-фактура требует number.");
+        if (!date) throw new InputError("Исторический счёт-фактура требует date.");
+        if (!invoiceKind) throw new InputError("Исторический счёт-фактура требует invoiceKind.");
+        if (!operationCode) throw new InputError("Исторический счёт-фактура требует operationCode.");
+        if (!basisDocuments?.length)
+          throw new InputError("Исторический счёт-фактура требует непустой basisDocuments.");
+        if (invoiceKind === "НаАванс") {
+          if (sumTotal === undefined || sumVat === undefined)
+            throw new InputError("Исторический авансовый счёт-фактура требует явные sumTotal и sumVat.");
+          if (!advanceRows?.length)
+            throw new InputError("Исторический авансовый счёт-фактура требует непустой advanceRows.");
+        }
+        const first = basisDocuments[0]!;
+        if (
+          first.ref.replace(/[{}]/g, "").toLowerCase() !==
+          (baseDocumentRef ?? first.ref).replace(/[{}]/g, "").toLowerCase()
+        )
+          throw new InputError("basisDocuments[0] не совпадает с baseDocumentRef.");
+        const available = await conn.available();
+        const lineNumbers = new Set<number>();
+        for (const row of basisDocuments) {
+          const typeSet = row.type.replace(/^StandardODATA\./, "");
+          if (!available.has(typeSet))
+            throw new InputError(`Тип основания ${row.type} не опубликован в OData.`);
+          const line = row.lineNumber ?? 0;
+          if (line && lineNumbers.has(line)) throw new InputError(`Строка основания ${line} повторяется.`);
+          if (line) lineNumbers.add(line);
+          const found = await conn.client.getEntity(
+            `${typeSet}(${odataGuid(row.ref)})?$format=json&$select=Ref_Key,DeletionMark`,
+          );
+          if (
+            String(found["Ref_Key"] ?? "")
+              .replace(/[{}]/g, "")
+              .toLowerCase() !== row.ref.toLowerCase()
+          )
+            throw new InputError(`Основание ${row.ref} (${row.type}) не найдено.`);
+          if (found["DeletionMark"] === true)
+            throw new InputError(`Основание ${row.ref} помечено на удаление.`);
+        }
+        const b = await invoiceBasis(conn, first.type.replace(/^StandardODATA\./, ""), first.ref);
+        const cpSet = resolveEntity(CATALOGS.counterparties, available);
+        if (!cpSet)
+          throw new InputError("Справочник контрагентов не опубликован: типы оснований не проверить.");
+        const cpType = `StandardODATA.${cpSet}`;
+        for (const row of basisDocuments) {
+          const typeSet = row.type.replace(/^StandardODATA\./, "");
+          const props = new Map(
+            (await conn.getMetadata()).entities.get(typeSet)?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          if (!props.has("Организация_Key"))
+            throw new InputError(`Основание ${row.type} не публикует Организация_Key: связь не проверить.`);
+          const partyKey = props.has("Контрагент_Key");
+          const partyTyped = props.has("Контрагент") && props.has("Контрагент_Type");
+          if (!partyKey && !partyTyped)
+            throw new InputError(`Основание ${row.type} не публикует контрагента: связь не проверить.`);
+          const select = [
+            "Ref_Key",
+            "DeletionMark",
+            "Организация_Key",
+            ...(partyKey ? ["Контрагент_Key"] : ["Контрагент", "Контрагент_Type"]),
+          ];
+          const found = await conn.client.getEntity(
+            `${typeSet}(${odataGuid(row.ref)})?$format=json&$select=${select.join(",")}`,
+          );
+          if (
+            String(found["Ref_Key"] ?? "")
+              .replace(/[{}]/g, "")
+              .toLowerCase() !== row.ref.toLowerCase()
+          )
+            throw new InputError(`Основание ${row.ref} (${row.type}) не найдено.`);
+          if (found["DeletionMark"] === true)
+            throw new InputError(`Основание ${row.ref} помечено на удаление.`);
+          const basisOrg = String(found["Организация_Key"] ?? "")
+            .replace(/[{}]/g, "")
+            .toLowerCase();
+          if (!basisOrg || basisOrg !== b.org.toLowerCase())
+            throw new InputError(`Основание ${row.ref} относится к другой организации или без организации.`);
+          if (partyTyped) {
+            const typed = String(found["Контрагент_Type"] ?? "");
+            if (typed !== cpType)
+              throw new InputError(`Основание ${row.ref} имеет неожидаемый тип контрагента ${typed}.`);
+          }
+          const basisCp = String(found[partyKey ? "Контрагент_Key" : "Контрагент"] ?? "")
+            .replace(/[{}]/g, "")
+            .toLowerCase();
+          if (!basisCp || basisCp !== b.counterparty.toLowerCase())
+            throw new InputError(`Основание ${row.ref} относится к другому контрагенту или без контрагента.`);
+        }
+        const isZeroRef = (v: string | undefined): boolean =>
+          v !== undefined && v.replace(/[{}]/g, "").toLowerCase() === EMPTY_GUID;
+        const validateRefTarget = async (ref: string, typeSet: string, label: string): Promise<void> => {
+          if (isZeroRef(ref)) return;
+          const availableTypes = await conn.available();
+          if (!availableTypes.has(typeSet))
+            throw new InputError(`Набор ${typeSet} для ${label} не опубликован.`);
+          const found = await conn.client.getEntity(
+            `${typeSet}(${odataGuid(ref)})?$format=json&$select=Ref_Key,DeletionMark`,
+          );
+          if (
+            String(found["Ref_Key"] ?? "")
+              .replace(/[{}]/g, "")
+              .toLowerCase() !== ref.toLowerCase()
+          )
+            throw new InputError(`${label} ${ref} не найден.`);
+          if (found["DeletionMark"] === true) throw new InputError(`${label} ${ref} помечен на удаление.`);
+        };
+        if (contractRef && !isZeroRef(contractRef))
+          await resolveCustomerContract(conn, {
+            orgKey: b.org,
+            counterpartyRef: b.counterparty,
+            contractRef,
+          });
+        if (currencyRef) await validateRefTarget(currencyRef, "Catalog_Валюты", "Валюта");
+        if (responsibleRef) await validateRefTarget(responsibleRef, "Catalog_ФизическиеЛица", "Руководитель");
+        if (chiefAccountantRef)
+          await validateRefTarget(chiefAccountantRef, "Catalog_ФизическиеЛица", "Главный бухгалтер");
+        if (invoiceForPaymentRef)
+          await validateRefTarget(invoiceForPaymentRef, "Document_СчетНаОплатуПокупателю", "Счёт на оплату");
+        const headerPaymentDateValue =
+          headerPaymentDate === undefined
+            ? undefined
+            : headerPaymentDate === ""
+              ? ""
+              : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(headerPaymentDate)
+                ? headerPaymentDate
+                : /^\d{4}-\d{2}-\d{2}$/.test(headerPaymentDate)
+                  ? odataDate(new Date(`${headerPaymentDate}T00:00:00`))
+                  : (() => {
+                      throw new InputError(
+                        "headerPaymentDate: ожидается YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS.",
+                      );
+                    })();
+        const docDate = new Date(`${date}T${time ?? "00:00:00"}`);
+        const issue = new Date(`${issueDate ?? date}T${issueTime ?? time ?? "00:00:00"}`);
+        const props = new Map(
+          (await conn.getMetadata()).entities.get(set)?.properties.map((p) => [p.name, p.type]) ?? [],
+        );
+        const need = (field: string, type: string) => {
+          if (props.get(field) !== type)
+            throw new InputError(`Схема счёта-фактуры не публикует ${field} с типом ${type}.`);
+        };
+        for (const [field, type] of [
+          ["Number", "Edm.String"],
+          ["Date", "Edm.DateTime"],
+          ["ДатаВыставления", "Edm.DateTime"],
+          ["ВидСчетаФактуры", "Edm.String"],
+          ["КодВидаОперации", "Edm.String"],
+          ["Организация_Key", "Edm.Guid"],
+          ["Контрагент_Key", "Edm.Guid"],
+          ["ДоговорКонтрагента_Key", "Edm.Guid"],
+          ["СуммаДокумента", "Edm.Double"],
+          ["СуммаНДСДокумента", "Edm.Double"],
+          [
+            "ДокументыОснования",
+            "Collection(StandardODATA.Document_СчетФактураВыданный_ДокументыОснования_RowType)",
+          ],
+          [
+            "ПлатежноРасчетныеДокументы",
+            "Collection(StandardODATA.Document_СчетФактураВыданный_ПлатежноРасчетныеДокументы_RowType)",
+          ],
+          ["Posted", "Edm.Boolean"],
+          ["DeletionMark", "Edm.Boolean"],
+        ] as const)
+          need(field, type);
+        for (const [field, type, provided] of [
+          ["ВалютаДокумента_Key", "Edm.Guid", currencyRef !== undefined],
+          ["Руководитель_Key", "Edm.Guid", responsibleRef !== undefined],
+          ["ГлавныйБухгалтер_Key", "Edm.Guid", chiefAccountantRef !== undefined],
+          ["СчетНаОплату_Key", "Edm.Guid", invoiceForPaymentRef !== undefined],
+          ["Комментарий", "Edm.String", comment !== undefined],
+          ["ПредставлениеНомера", "Edm.String", numberRepresentation !== undefined],
+          ["НомерПлатежноРасчетногоДокумента", "Edm.String", headerPaymentNumber !== undefined],
+          ["СтавкаНДС", "Edm.String", headerVatRate !== undefined],
+          ["ДатаПлатежноРасчетногоДокумента", "Edm.DateTime", headerPaymentDate !== undefined],
+          ["Выставлен", "Edm.Boolean", issued !== undefined],
+          ["СчетФактураНеВыставляется", "Edm.Boolean", invoiceNotIssued !== undefined],
+          ["СчетФактураБезНДС", "Edm.Boolean", invoiceWithoutVat !== undefined],
+          ["РучнаяКорректировка", "Edm.Boolean", manualCorrection !== undefined],
+          ["Исправление", "Edm.Boolean", correction !== undefined],
+          ["Под0", "Edm.Boolean", sub0 !== undefined],
+          ["СформированПриВводеНачальныхОстатковНДС", "Edm.Boolean", initialBalanceVat !== undefined],
+          ["КодСпособаВыставления", "Edm.Int16", representationMethod !== undefined],
+          ["Сумма", "Edm.Double", headerSum !== undefined],
+          ["СуммаНДС", "Edm.Double", headerVat !== undefined],
+        ] as const)
+          if (provided) need(field, type);
+        for (const [suffix, fields] of [
+          [
+            "ДокументыОснования",
+            [
+              "LineNumber",
+              "ДокументОснование",
+              "ДокументОснование_Type",
+              "УчитыватьИсправлениеИсходногоДокумента",
+            ],
+          ],
+          ["ПлатежноРасчетныеДокументы", ["LineNumber", "НомерДокумента", "ДатаДокумента"]],
+          ["Авансы", ["LineNumber", "Номенклатура_Key", "Сумма", "СтавкаНДС", "СуммаНДС"]],
+        ] as const) {
+          const rowProps = new Map(
+            (await conn.getMetadata()).entities
+              .get(`${set}_${suffix}`)
+              ?.properties.map((p) => [p.name, p.type]) ?? [],
+          );
+          for (const field of fields)
+            if (!rowProps.has(field)) throw new InputError(`Схема таблицы ${suffix} не публикует ${field}.`);
+        }
+        const effectiveLines = basisDocuments.map((row, i) => row.lineNumber ?? i + 1);
+        if (new Set(effectiveLines).size !== effectiveLines.length)
+          throw new InputError("Строки basisDocuments после нормализации номеров повторяются.");
+        const basisBuilt = basisDocuments.map((row, i) =>
+          buildHistoricalFields(
+            [
+              {
+                name: "LineNumber",
+                type: "number",
+                intent: { kind: "value", value: effectiveLines[i] },
+                required: true,
+              },
+              {
+                name: "ДокументОснование",
+                type: "string",
+                intent: { kind: "value", value: row.ref },
+                required: true,
+              },
+              {
+                name: "ДокументОснование_Type",
+                type: "string",
+                intent: { kind: "value", value: row.type },
+                required: true,
+              },
+              row.sourceNumber === undefined
+                ? { name: "НомерИсходногоДокумента", type: "string", intent: { kind: "omitted" } }
+                : {
+                    name: "НомерИсходногоДокумента",
+                    type: "string",
+                    intent:
+                      row.sourceNumber === ""
+                        ? { kind: "empty" }
+                        : { kind: "value", value: row.sourceNumber },
+                  },
+              row.sourceDate === undefined
+                ? { name: "ДатаИсходногоДокумента", type: "datetime", intent: { kind: "omitted" } }
+                : {
+                    name: "ДатаИсходногоДокумента",
+                    type: "datetime",
+                    intent: { kind: "value", value: odataDate(new Date(`${row.sourceDate}T00:00:00`)) },
+                  },
+              row.considerCorrection === undefined
+                ? {
+                    name: "УчитыватьИсправлениеИсходногоДокумента",
+                    type: "boolean",
+                    intent: { kind: "omitted" },
+                  }
+                : {
+                    name: "УчитыватьИсправлениеИсходногоДокумента",
+                    type: "boolean",
+                    intent: { kind: "value", value: row.considerCorrection },
+                  },
+            ],
+            { strictEmpty: true },
+          ),
+        );
+        const paymentDateTime = (value: string | undefined, label: string): string | undefined => {
+          if (value === undefined) return undefined;
+          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(value)) return value;
+          if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return odataDate(new Date(`${value}T00:00:00`));
+          throw new InputError(`${label}: ожидается YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS.`);
+        };
+        const paymentBuilt = (paymentDocuments ?? []).map((row, i) =>
+          buildHistoricalFields([
+            { name: "LineNumber", type: "number", intent: { kind: "value", value: i + 1 }, required: true },
+            {
+              name: "НомерДокумента",
+              type: "string",
+              intent: { kind: "value", value: row.number },
+              required: true,
+            },
+            {
+              name: "ДатаДокумента",
+              type: "datetime",
+              intent: { kind: "value", value: paymentDateTime(row.date, "paymentDocuments.date")! },
+              required: true,
+            },
+            row.invoiceNumber === undefined
+              ? { name: "НомерСчетаФактурыНаАванс", type: "string", intent: { kind: "omitted" } }
+              : {
+                  name: "НомерСчетаФактурыНаАванс",
+                  type: "string",
+                  intent: { kind: "value", value: row.invoiceNumber },
+                },
+            row.invoiceDate === undefined
+              ? { name: "ДатаСчетаФактурыНаАванс", type: "datetime", intent: { kind: "omitted" } }
+              : {
+                  name: "ДатаСчетаФактурыНаАванс",
+                  type: "datetime",
+                  intent: {
+                    kind: "value",
+                    value: paymentDateTime(row.invoiceDate, "paymentDocuments.invoiceDate")!,
+                  },
+                },
+          ]),
+        );
+        for (const row of advanceRows ?? []) {
+          const hasRef = row.basisRef !== undefined;
+          const hasType = row.basisType !== undefined;
+          if (row.basisEmpty && (hasRef || hasType))
+            throw new InputError("advanceRows: basisEmpty нельзя сочетать с basisRef/basisType.");
+          if (hasRef !== hasType)
+            throw new InputError("advanceRows: basisRef и basisType должны быть заданы парой.");
+          if (hasRef) {
+            const declared = basisDocuments.some(
+              (b) =>
+                b.ref.replace(/[{}]/g, "").toLowerCase() ===
+                  row.basisRef!.replace(/[{}]/g, "").toLowerCase() && b.type === row.basisType,
+            );
+            if (!declared) throw new InputError("advanceRows: основание строки не входит в basisDocuments.");
+          }
+          if (
+            row.counterpartyRef &&
+            row.counterpartyRef.replace(/[{}]/g, "").toLowerCase() !== EMPTY_GUID &&
+            row.counterpartyRef.toLowerCase() !== b.counterparty.toLowerCase()
+          )
+            throw new InputError("advanceRows: контрагент строки не совпадает с шапкой.");
+        }
+        const optionalAdvance = (
+          name: string,
+          type: "string" | "guid" | "datetime" | "number",
+          v: unknown,
+        ) => {
+          if (v === undefined) return { name, type, intent: { kind: "omitted" as const } };
+          const encoded =
+            type === "datetime" && typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v)
+              ? odataDate(new Date(`${v}T00:00:00`))
+              : v;
+          return { name, type, intent: { kind: "value" as const, value: encoded } };
+        };
+        const advanceBuilt = (advanceRows ?? []).map((row, i) =>
+          buildHistoricalFields([
+            { name: "LineNumber", type: "number", intent: { kind: "value", value: i + 1 }, required: true },
+            {
+              name: "Номенклатура_Key",
+              type: "guid",
+              intent: { kind: "value", value: row.nomenclatureRef },
+              required: true,
+            },
+            row.content === undefined
+              ? { name: "Содержание", type: "string", intent: { kind: "omitted" } }
+              : {
+                  name: "Содержание",
+                  type: "string",
+                  intent: row.content === "" ? { kind: "empty" } : { kind: "value", value: row.content },
+                },
+            { name: "Сумма", type: "number", intent: { kind: "value", value: row.amount }, required: true },
+            {
+              name: "СтавкаНДС",
+              type: "string",
+              intent: { kind: "value", value: row.vatRate },
+              required: true,
+            },
+            {
+              name: "СуммаНДС",
+              type: "number",
+              intent: { kind: "value", value: row.vatAmount },
+              required: true,
+            },
+            row.counterpartyRef === undefined
+              ? { name: "Контрагент_Key", type: "guid", intent: { kind: "omitted" } }
+              : {
+                  name: "Контрагент_Key",
+                  type: "guid",
+                  intent: { kind: "value", value: row.counterpartyRef },
+                },
+            row.basisEmpty
+              ? { name: "ДокументОснование", type: "string", intent: { kind: "empty" } }
+              : row.basisRef === undefined
+                ? { name: "ДокументОснование", type: "string", intent: { kind: "omitted" } }
+                : {
+                    name: "ДокументОснование",
+                    type: "string",
+                    intent: { kind: "value", value: row.basisRef },
+                  },
+            row.basisEmpty
+              ? { name: "ДокументОснование_Type", type: "string", intent: { kind: "empty" } }
+              : row.basisType === undefined
+                ? { name: "ДокументОснование_Type", type: "string", intent: { kind: "omitted" } }
+                : {
+                    name: "ДокументОснование_Type",
+                    type: "string",
+                    intent: { kind: "value", value: row.basisType },
+                  },
+            optionalAdvance("ДатаПлатежноРасчетногоДокумента", "datetime", row.paymentDate),
+            optionalAdvance("НомерПлатежноРасчетногоДокумента", "string", row.paymentNumber),
+            optionalAdvance("НомерСчетаФактурыПродавца", "string", row.sellerInvoiceNumber),
+            optionalAdvance("КорректируемыйСчетФактура_Key", "guid", row.correctionRef),
+            optionalAdvance("СуммаДоКорректировки", "number", row.amountBeforeCorrection),
+            optionalAdvance("СтавкаНДСДоКорректировки", "string", row.vatRateBeforeCorrection),
+            optionalAdvance("СуммаНДСДоКорректировки", "number", row.vatAmountBeforeCorrection),
+          ]),
+        );
+        const total = sumTotal ?? b.total;
+        const vat = sumVat ?? b.vat;
+        const headerBuilt = buildHistoricalFields(
+          [
+            {
+              name: "Date",
+              type: "datetime",
+              intent: { kind: "value", value: odataDate(docDate) },
+              required: true,
+            },
+            {
+              name: "Number",
+              type: "string",
+              intent: { kind: "value", value: number.trim() },
+              required: true,
+            },
+            { name: "Posted", type: "boolean", intent: { kind: "value", value: false }, required: true },
+            {
+              name: "ВидСчетаФактуры",
+              type: "string",
+              intent: { kind: "value", value: invoiceKind },
+              required: true,
+            },
+            {
+              name: "Организация_Key",
+              type: "guid",
+              intent: { kind: "value", value: b.org },
+              required: true,
+            },
+            {
+              name: "Контрагент_Key",
+              type: "guid",
+              intent: { kind: "value", value: b.counterparty },
+              required: true,
+            },
+            contractRef === undefined
+              ? b.contract
+                ? {
+                    name: "ДоговорКонтрагента_Key",
+                    type: "guid" as const,
+                    intent: { kind: "value" as const, value: b.contract },
+                    required: true,
+                  }
+                : {
+                    name: "ДоговорКонтрагента_Key",
+                    type: "guid" as const,
+                    intent: { kind: "omitted" as const },
+                  }
+              : contractRef === EMPTY_GUID
+                ? {
+                    name: "ДоговорКонтрагента_Key",
+                    type: "guid" as const,
+                    intent: { kind: "empty" as const },
+                  }
+                : {
+                    name: "ДоговорКонтрагента_Key",
+                    type: "guid" as const,
+                    intent: { kind: "value" as const, value: contractRef },
+                    required: true,
+                  },
+            {
+              name: "ДатаВыставления",
+              type: "datetime",
+              intent: { kind: "value", value: odataDate(issue) },
+              required: true,
+            },
+            {
+              name: "КодВидаОперации",
+              type: "string",
+              intent: { kind: "value", value: operationCode },
+              required: true,
+            },
+            {
+              name: "СуммаДокумента",
+              type: "number",
+              intent: { kind: "value", value: total },
+              required: true,
+            },
+            {
+              name: "СуммаНДСДокумента",
+              type: "number",
+              intent: { kind: "value", value: vat },
+              required: true,
+            },
+            {
+              name: "ДокументОснование",
+              type: "string",
+              intent: { kind: "value", value: first.ref },
+              required: true,
+            },
+            {
+              name: "ДокументОснование_Type",
+              type: "string",
+              intent: { kind: "value", value: first.type },
+              required: true,
+            },
+            ...(currencyRef === undefined
+              ? []
+              : [
+                  currencyRef === EMPTY_GUID
+                    ? {
+                        name: "ВалютаДокумента_Key",
+                        type: "guid" as const,
+                        intent: { kind: "empty" as const },
+                      }
+                    : {
+                        name: "ВалютаДокумента_Key",
+                        type: "guid" as const,
+                        intent: { kind: "value" as const, value: currencyRef },
+                        required: true,
+                      },
+                ]),
+            ...(responsibleRef === undefined
+              ? []
+              : [
+                  responsibleRef === EMPTY_GUID
+                    ? { name: "Руководитель_Key", type: "guid" as const, intent: { kind: "empty" as const } }
+                    : {
+                        name: "Руководитель_Key",
+                        type: "guid" as const,
+                        intent: { kind: "value" as const, value: responsibleRef },
+                        required: true,
+                      },
+                ]),
+            ...(chiefAccountantRef === undefined
+              ? []
+              : [
+                  chiefAccountantRef === EMPTY_GUID
+                    ? {
+                        name: "ГлавныйБухгалтер_Key",
+                        type: "guid" as const,
+                        intent: { kind: "empty" as const },
+                      }
+                    : {
+                        name: "ГлавныйБухгалтер_Key",
+                        type: "guid" as const,
+                        intent: { kind: "value" as const, value: chiefAccountantRef },
+                        required: true,
+                      },
+                ]),
+            ...(invoiceForPaymentRef === undefined
+              ? []
+              : [
+                  invoiceForPaymentRef === EMPTY_GUID
+                    ? { name: "СчетНаОплату_Key", type: "guid" as const, intent: { kind: "empty" as const } }
+                    : {
+                        name: "СчетНаОплату_Key",
+                        type: "guid" as const,
+                        intent: { kind: "value" as const, value: invoiceForPaymentRef },
+                        required: true,
+                      },
+                ]),
+            ...(comment === undefined
+              ? []
+              : [
+                  {
+                    name: "Комментарий",
+                    type: "string" as const,
+                    intent:
+                      comment === ""
+                        ? { kind: "empty" as const }
+                        : { kind: "value" as const, value: comment },
+                  },
+                ]),
+            ...(numberRepresentation === undefined
+              ? []
+              : [
+                  {
+                    name: "ПредставлениеНомера",
+                    type: "string" as const,
+                    intent:
+                      numberRepresentation === ""
+                        ? { kind: "empty" as const }
+                        : { kind: "value" as const, value: numberRepresentation },
+                  },
+                ]),
+            ...(headerPaymentNumber === undefined
+              ? []
+              : [
+                  {
+                    name: "НомерПлатежноРасчетногоДокумента",
+                    type: "string" as const,
+                    intent:
+                      headerPaymentNumber === ""
+                        ? { kind: "empty" as const }
+                        : { kind: "value" as const, value: headerPaymentNumber },
+                  },
+                ]),
+            ...(headerVatRate === undefined
+              ? []
+              : [
+                  {
+                    name: "СтавкаНДС",
+                    type: "string" as const,
+                    intent:
+                      headerVatRate === ""
+                        ? { kind: "empty" as const }
+                        : { kind: "value" as const, value: headerVatRate },
+                  },
+                ]),
+            ...(headerPaymentDateValue === undefined
+              ? []
+              : [
+                  {
+                    name: "ДатаПлатежноРасчетногоДокумента",
+                    type: "datetime" as const,
+                    intent:
+                      headerPaymentDateValue === ""
+                        ? { kind: "empty" as const }
+                        : { kind: "value" as const, value: headerPaymentDateValue },
+                  },
+                ]),
+            ...(issued === undefined
+              ? []
+              : [
+                  {
+                    name: "Выставлен",
+                    type: "boolean" as const,
+                    intent: { kind: "value" as const, value: issued },
+                  },
+                ]),
+            ...(invoiceNotIssued === undefined
+              ? []
+              : [
+                  {
+                    name: "СчетФактураНеВыставляется",
+                    type: "boolean" as const,
+                    intent: { kind: "value" as const, value: invoiceNotIssued },
+                  },
+                ]),
+            ...(invoiceWithoutVat === undefined
+              ? []
+              : [
+                  {
+                    name: "СчетФактураБезНДС",
+                    type: "boolean" as const,
+                    intent: { kind: "value" as const, value: invoiceWithoutVat },
+                  },
+                ]),
+            ...(manualCorrection === undefined
+              ? []
+              : [
+                  {
+                    name: "РучнаяКорректировка",
+                    type: "boolean" as const,
+                    intent: { kind: "value" as const, value: manualCorrection },
+                  },
+                ]),
+            ...(correction === undefined
+              ? []
+              : [
+                  {
+                    name: "Исправление",
+                    type: "boolean" as const,
+                    intent: { kind: "value" as const, value: correction },
+                  },
+                ]),
+            ...(sub0 === undefined
+              ? []
+              : [
+                  { name: "Под0", type: "boolean" as const, intent: { kind: "value" as const, value: sub0 } },
+                ]),
+            ...(initialBalanceVat === undefined
+              ? []
+              : [
+                  {
+                    name: "СформированПриВводеНачальныхОстатковНДС",
+                    type: "boolean" as const,
+                    intent: { kind: "value" as const, value: initialBalanceVat },
+                  },
+                ]),
+            ...(representationMethod === undefined
+              ? []
+              : [
+                  {
+                    name: "КодСпособаВыставления",
+                    type: "number" as const,
+                    intent: { kind: "value" as const, value: representationMethod },
+                  },
+                ]),
+            ...(headerSum === undefined
+              ? []
+              : [
+                  {
+                    name: "Сумма",
+                    type: "number" as const,
+                    intent: { kind: "value" as const, value: headerSum },
+                  },
+                ]),
+            ...(headerVat === undefined
+              ? []
+              : [
+                  {
+                    name: "СуммаНДС",
+                    type: "number" as const,
+                    intent: { kind: "value" as const, value: headerVat },
+                  },
+                ]),
+          ],
+          { strictEmpty: true },
+        );
+        const payload = {
+          ...headerBuilt.payload,
+          ДокументыОснования: basisBuilt.map((b) => b.payload),
+          ...(paymentDocuments !== undefined
+            ? { ПлатежноРасчетныеДокументы: paymentBuilt.map((b) => b.payload) }
+            : {}),
+          ...(advanceRows !== undefined ? { Авансы: advanceBuilt.map((b) => b.payload) } : {}),
+          ...(emptyShipmentDocuments !== undefined ? { ДокументыОбОтгрузке: [] } : {}),
+          ...(emptyCorrectableLineNumbers !== undefined ? { КорректируемыеНомераСтрок: [] } : {}),
+        };
+        // Точный поиск до POST и после 500/обрыва; 404 сам по себе не доказывает отсутствие.
+        type ExactSearch =
+          | { state: "found"; hit: Record<string, unknown> }
+          | { state: "none" | "ambiguous" | "incomplete" | "unavailable" };
+        const findExact = async (): Promise<ExactSearch> => {
+          let read: Awaited<ReturnType<typeof fetchAll<ODataEntity>>>;
+          try {
+            read = await fetchAll<ODataEntity>(
+              conn.client,
+              set,
+              {
+                filter: and(
+                  cmp("Number", "eq", odataString(number.trim())),
+                  cmp("Организация_Key", "eq", odataGuid(b.org)),
+                ),
+                select: ["Ref_Key", "Number", "Date", "Организация_Key"],
+              },
+              conn.behavior.pageSize,
+              200,
+            );
+          } catch {
+            return { state: "unavailable" };
+          }
+          if (read.truncated) return { state: "incomplete" };
+          const year = String(odataDate(docDate)).slice(0, 4);
+          const hits = read.rows.filter((r) => String(r["Date"] ?? "").slice(0, 4) === year);
+          if (hits.length > 1) return { state: "ambiguous" };
+          return hits[0] ? { state: "found", hit: hits[0] } : { state: "none" };
+        };
+        const preflight = await findExact();
+        if (preflight.state === "incomplete" || preflight.state === "unavailable")
+          throw new InputError("Проверка дубля счёта-фактуры неполная; POST запрещён.");
+        if (preflight.state === "ambiguous")
+          throw new InputError("Проверка дубля счёта-фактуры неоднозначна; POST запрещён.");
+        if (preflight.state === "found")
+          throw new InputError(
+            `Исторический счёт-фактура с номером «${number}» уже существует: ${String(preflight.hit["Ref_Key"] ?? "")}.`,
+          );
+        let created: CallToolResult;
+        try {
+          created = await createOrPreview(conn, set, payload, confirm, undefined, {
+            verificationRequired: true,
+            preserveComment: true,
+          });
+        } catch (error) {
+          const chain: Error[] = [];
+          let cursor: unknown = error;
+          for (let depth = 0; depth < 6 && cursor instanceof Error; depth++) {
+            chain.push(cursor);
+            cursor = cursor.cause;
+          }
+          const odata = chain.find((e): e is ODataError => e instanceof ODataError);
+          const server = [...chain]
+            .reverse()
+            .find((e): e is ODataError => e instanceof ODataError && e.status !== undefined);
+          const operationId = currentWriteOperationId();
+          const search = await findExact();
+          const recovered = search.state === "found" ? search.hit : undefined;
+          const searchState = search.state;
+          const outcome = recovered ? "possibly_created" : "unknown";
+          return {
+            isError: true,
+            _meta: { "odata-1c/errorKind": odata?.kind ?? "unknown" },
+            content: [
+              {
+                type: "text",
+                text: `Счёт-фактура выданный: стадия POST, outcome=${outcome}; повтор не выполнялся.`,
+              },
+            ],
+            structuredContent: {
+              database: conn.cfg.name,
+              entitySet: set,
+              profile: "historical-issued-invoice",
+              stage: "POST",
+              errorKind: odata?.kind ?? "unknown",
+              httpStatus: server?.status,
+              retryable: odata?.retryable ?? false,
+              causeChain: chain.map((e) => ({
+                name: e.name,
+                ...(e instanceof ODataError ? { kind: e.kind, status: e.status } : {}),
+              })),
+              serverReason:
+                server && /^Ошибка сервера 1С \(\d+\)/.test(server.message)
+                  ? server.message.slice(0, 300)
+                  : undefined,
+              operationId,
+              outcome,
+              recheck: {
+                search: searchState,
+                targetRef: recovered?.["Ref_Key"],
+                recovery: "write.operation.status",
+              },
+            },
+          };
+        }
+        if (!confirm || created.isError) return created;
+        const createdData = created.structuredContent as Record<string, unknown> | undefined;
+        const ref = typeof createdData?.ref === "string" ? createdData.ref : "";
+        if (!ref) return created;
+        let actual: ODataEntity;
+        try {
+          actual = await conn.client.getEntity(`${set}(${odataGuid(ref)})?$format=json`);
+        } catch {
+          const failedOp = currentWriteOperationId();
+          if (failedOp)
+            await conn.client
+              .recordOperationVerification(failedOp, "failed", "GET после POST не удался")
+              .catch(() => undefined);
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "unknown" },
+            content: [
+              {
+                type: "text",
+                text: "Счёт-фактура создан, но контрольное чтение не удалось; outcome=unknown, повтор запрещён.",
+              },
+            ],
+            structuredContent: {
+              ...createdData,
+              verification: "failed",
+              outcome: "unknown",
+              operationId: currentWriteOperationId(),
+              stage: "GET",
+              recovery: "write.operation.status",
+            },
+          };
+        }
+        const headerMismatches = compareHistoricalFields(actual, [
+          ...headerBuilt.expectations,
+          { name: "DeletionMark", type: "boolean", expected: false, required: true, empty: false },
+        ]);
+        const mismatches: Array<{ field: string; expected: unknown; actual: unknown }> = headerMismatches.map(
+          (m) => ({ field: m.field, expected: m.expected, actual: m.actual }),
+        );
+        const compareRows = (name: string, built: typeof basisBuilt) => {
+          const actualRows = actual[name];
+          if (!Array.isArray(actualRows) || actualRows.length !== built.length) {
+            mismatches.push({ field: name, expected: `строк: ${built.length}`, actual: "не совпало" });
+            return;
+          }
+          built.forEach((row, index) => {
+            const rowMismatches = compareHistoricalFields(
+              actualRows[index] as Record<string, unknown>,
+              row.expectations,
+            );
+            for (const m of rowMismatches)
+              mismatches.push({
+                field: `${name}[${index + 1}].${m.field}`,
+                expected: m.expected,
+                actual: m.actual,
+              });
+          });
+        };
+        compareRows("ДокументыОснования", basisBuilt);
+        if (paymentDocuments !== undefined) compareRows("ПлатежноРасчетныеДокументы", paymentBuilt);
+        if (advanceRows !== undefined) compareRows("Авансы", advanceBuilt);
+        for (const [name, supplied] of [
+          ["ДокументыОбОтгрузке", emptyShipmentDocuments !== undefined],
+          ["КорректируемыеНомераСтрок", emptyCorrectableLineNumbers !== undefined],
+        ] as const) {
+          if (!supplied) continue;
+          const value = actual[name];
+          if (!Array.isArray(value) || value.length !== 0)
+            mismatches.push({ field: name, expected: "явно пустая таблица", actual: value });
+        }
+        if (mismatches.length) {
+          const failedOp = currentWriteOperationId();
+          if (failedOp)
+            await conn.client
+              .recordOperationVerification(failedOp, "failed", mismatches.map((m) => m.field).join(", "))
+              .catch(() => undefined);
+          return {
+            ...created,
+            isError: true,
+            _meta: { "odata-1c/errorKind": "refused" },
+            content: [
+              {
+                type: "text",
+                text: `Счёт-фактура создан (Ref_Key ${ref}), но readback не подтвердил: ${mismatches.map((m) => m.field).join(", ")}. Повтор запрещён.`,
+              },
+            ],
+            structuredContent: {
+              ...createdData,
+              verification: "failed",
+              mismatches,
+              operationId: currentWriteOperationId(),
+              stage: "GET",
+            },
+          };
+        }
+        {
+          const okOp = currentWriteOperationId();
+          if (okOp) {
+            try {
+              await conn.client.recordOperationVerification(okOp, "ok");
+            } catch {
+              return {
+                ...created,
+                isError: true,
+                _meta: { "odata-1c/errorKind": "unknown" },
+                content: [
+                  {
+                    type: "text",
+                    text: "Счёт-фактура записан, но результат readback не сохранился в журнале; outcome=unknown, повтор запрещён.",
+                  },
+                ],
+                structuredContent: {
+                  ...createdData,
+                  verification: "pending",
+                  outcome: "unknown",
+                  operationId: okOp,
+                  stage: "VERIFY",
+                },
+              };
+            }
+          }
+        }
+        return withStructured(created, {
+          verification: "ok",
+          verifiedFields: [
+            ...headerBuilt.expectations.map((e) => e.name),
+            ...basisBuilt.flatMap((row, i) =>
+              row.expectations.map((e) => `ДокументыОснования[${i + 1}].${e.name}`),
+            ),
+            ...paymentBuilt.flatMap((row, i) =>
+              row.expectations.map((e) => `ПлатежноРасчетныеДокументы[${i + 1}].${e.name}`),
+            ),
+            ...advanceBuilt.flatMap((row, i) => row.expectations.map((e) => `Авансы[${i + 1}].${e.name}`)),
+          ],
         });
-        const payload = clean({
-          Date: d,
-          Posted: false,
-          ВидСчетаФактуры: "НаРеализацию",
-          Организация_Key: b.org,
-          Контрагент_Key: b.counterparty,
-          ДоговорКонтрагента_Key: b.contract,
-          ДокументОснование: baseGuid,
-          ДокументОснование_Type: `StandardODATA.${baseSet}`,
-          ДатаВыставления: d,
-          КодВидаОперации: operationCode ?? "01",
-          СуммаДокумента: b.total,
-          СуммаНДСДокумента: b.vat,
-          ДокументыОснования: [baseRow],
-        });
-        return createOrPreview(conn, set, payload, confirm);
       }),
   );
 
@@ -5900,6 +7055,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             ],
             structuredContent: { ...createdData, verification: "failed", mismatches: mismatch },
           };
+        {
+          const okOp = currentWriteOperationId();
+          if (okOp) await conn.client.recordOperationVerification(okOp, "ok").catch(() => undefined);
+        }
         return withStructured(created, {
           verification: "ok",
           verifiedFields: [...Object.keys(expectedHeader), "ДокументыОснования[1]"],

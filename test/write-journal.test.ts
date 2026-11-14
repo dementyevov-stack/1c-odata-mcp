@@ -347,7 +347,11 @@ describe("journal: line-count check, not-applied and settled()", () => {
     await j.prepare(ok, "Document_X", { ref: "r" }, "h");
     expect(await j.settled(ok, "h")).toBeUndefined(); // ещё не подтверждалась
     await j.execute(ok, "Document_X", { ref: "r" }, "h", async () => ({ Ref_Key: "r" }), check);
-    expect(await j.settled(ok, "h")).toEqual({ entitySet: "Document_X", result: { Ref_Key: "r" } });
+    expect(await j.settled(ok, "h")).toEqual({
+      entitySet: "Document_X",
+      result: { Ref_Key: "r" },
+      verificationRequired: false,
+    });
     await expect(j.settled(ok, "other")).rejects.toThrow(/не совпадают/);
 
     const lost = randomUUID();

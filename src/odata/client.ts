@@ -241,7 +241,10 @@ export class ODataClient {
   async prepareCreate(
     entitySet: string,
     payload: Record<string, unknown>,
-    { withRefKey = true }: { withRefKey?: boolean } = {},
+    {
+      withRefKey = true,
+      verificationRequired = false,
+    }: { withRefKey?: boolean; verificationRequired?: boolean } = {},
   ): Promise<void> {
     // Предпросмотр при выключенной записи ничего не пишет на диск (READ_ONLY по умолчанию).
     if (this.behavior.readOnly || !this.conn.writable) return;
@@ -255,6 +258,7 @@ export class ODataClient {
       payload,
       requestHash,
       withRefKey ? uuidV1() : undefined,
+      verificationRequired,
     );
   }
 
@@ -308,7 +312,16 @@ export class ODataClient {
   async operationSettled(
     operationId: string,
     requestHash: string,
-  ): Promise<{ entitySet: string; result: Record<string, string> } | undefined> {
+  ): Promise<
+    | {
+        entitySet: string;
+        result: Record<string, string>;
+        verification?: "pending" | "ok" | "failed";
+        verificationError?: string;
+        verificationRequired?: boolean;
+      }
+    | undefined
+  > {
     if (this.behavior.readOnly || !this.conn.writable) return undefined;
     return this.writeJournal.settled(operationId, requestHash);
   }
@@ -317,6 +330,16 @@ export class ODataClient {
   async journalSummary() {
     if (this.behavior.readOnly || !this.conn.writable) return undefined;
     return this.writeJournal.summary();
+  }
+
+  /** Сохраняет результат контрольного чтения в журнал операции. */
+  recordOperationVerification(operationId: string, status: "ok" | "failed", error?: string): Promise<void> {
+    return this.writeJournal.recordVerification(operationId, status, error);
+  }
+
+  /** Помечает квитанцию как требующую readback до признания успехом. */
+  markOperationVerificationPending(operationId: string): Promise<void> {
+    return this.writeJournal.markVerificationPending(operationId);
   }
 
   /** Сверка показала, что операция до 1С не дошла. */
